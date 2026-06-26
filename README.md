@@ -54,9 +54,22 @@ Copy the binary somewhere on your PATH, then copy `lua/` to your config director
 Tell your terminal to use `ttyrell` as its shell. It spawns your real `$SHELL` (or `%COMSPEC%` on Windows) internally.
 
 **Ghostty** (`~/.config/ghostty/config`):
+
+Open your Ghostty config with `ghostty +open-config` (or `Cmd+,` on macOS), then add:
+
 ```
 command = /usr/local/bin/ttyrell
 ```
+
+Verify the path first — if you installed from source, use `which ttyrell` and substitute the output:
+
+```
+command = /Users/you/.cargo/bin/ttyrell
+```
+
+Ghostty natively supports OSC 133 shell integration sequences, so the `command_start`, `command_exit`, and `prompt_start` events work without any extra configuration once you source the [shell integration script](#shell-integration).
+
+After saving, reload the config with `Cmd+Shift+,` (or restart Ghostty). Open a new tab or window to pick up the change — existing tabs continue using the old shell.
 
 **WezTerm** (`~/.wezterm.lua`):
 ```lua
