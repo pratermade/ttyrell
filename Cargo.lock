@@ -522,21 +522,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pty-proxy"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "bytes",
- "dirs",
- "libc",
- "mlua",
- "portable-pty",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -852,6 +837,21 @@ checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "ttyrell"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "dirs",
+ "libc",
+ "mlua",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

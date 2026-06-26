@@ -253,13 +253,16 @@ local response, err = llm.query("your prompt")
 
 ttyrell loads `lua/init.lua` from the first path that exists:
 
-| Platform | Path |
-|----------|------|
-| macOS | `~/Library/Application Support/ttyrell/lua/init.lua` |
-| Linux | `~/.config/ttyrell/lua/init.lua` |
-| Windows | `%APPDATA%\ttyrell\lua\init.lua` |
-| Fallback | `~/.ttyrell/lua/init.lua` |
-| Dev fallback | `./lua/init.lua` (current directory) |
+| Platform | Path | Notes |
+|----------|------|-------|
+| macOS | `~/Library/Application Support/ttyrell/lua/init.lua` | checked first |
+| macOS | `~/.config/ttyrell/lua/init.lua` | checked second |
+| Linux | `~/.config/ttyrell/lua/init.lua` | |
+| Windows | `%APPDATA%\ttyrell\lua\init.lua` | |
+| Fallback | `~/.ttyrell/lua/init.lua` | |
+| Dev fallback | `./lua/init.lua` (current directory) | |
+
+The first path that exists on disk is used.
 
 ### Session log locations
 

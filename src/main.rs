@@ -7,12 +7,24 @@ fn main() -> anyhow::Result<()> {
     let (lua, registry) = lua_api::init_lua().map_err(|e| anyhow::anyhow!("Lua init failed: {}", e))?;
 
     // Load user's init.lua from config dir or local path
-    let init_path = dirs::config_dir()
-        .map(|d| d.join("ttyrell").join("lua").join("init.lua"))
-        .or_else(|| {
-            let home = dirs::home_dir()?;
-            Some(home.join(".ttyrell").join("lua").join("init.lua"))
-        })
+    let home = dirs::home_dir();
+    let candidates: &[std::path::PathBuf] = &[
+        dirs::config_dir()
+            .map(|d| d.join("ttyrell").join("lua").join("init.lua"))
+            .unwrap_or_default(),
+        #[cfg(target_os = "macos")]
+        home.as_ref()
+            .map(|h| h.join(".config").join("ttyrell").join("lua").join("init.lua"))
+            .unwrap_or_default(),
+        home.as_ref()
+            .map(|h| h.join(".ttyrell").join("lua").join("init.lua"))
+            .unwrap_or_default(),
+        std::path::PathBuf::from("./lua/init.lua"),
+    ];
+    let init_path = candidates
+        .iter()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())
+        .cloned()
         .unwrap_or_else(|| std::path::PathBuf::from("./lua/init.lua"));
 
     if init_path.exists() {
