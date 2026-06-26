@@ -93,6 +93,33 @@ program = "/usr/local/bin/ttyrell"
 }
 ```
 
+### Using ttyrell with tmux
+
+ttyrell and tmux can be combined so that every tmux pane runs through the proxy. The recommended chain is:
+
+```
+Terminal → tmux (session manager) → ttyrell (per pane) → shell
+```
+
+This gives you tmux's session management and ttyrell's logging and AI features in every pane. Do **not** put ttyrell before tmux — it would only see raw tmux control bytes and shell integration events would not fire across pane boundaries.
+
+**Setup:**
+
+1. Keep your terminal's command set to launch tmux as normal. For Ghostty:
+   ```
+   command = /bin/zsh -c "tmux -f ~/.tmux.conf attach || tmux -f ~/.tmux.conf new-session"
+   ```
+
+2. Tell tmux to use `ttyrell` as the shell inside each pane. Add to `~/.tmux.conf`:
+   ```
+   set -g default-shell /usr/local/bin/ttyrell
+   ```
+   Verify the path with `which ttyrell` and substitute if different.
+
+3. Kill and reopen your tmux session to pick up the change. New panes will use ttyrell; existing panes will not.
+
+ttyrell reads `$SHELL` to find your real shell, so zsh (or whichever shell you use) is still what runs inside each pane. Shell integration in `~/.zshrc` continues to work normally.
+
 ---
 
 ## Shell integration
