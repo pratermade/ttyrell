@@ -50,11 +50,12 @@ impl EventRegistry {
 
         let mut suppressed = false;
         for cb in &callbacks {
-            let arg_values: Vec<Value> = args
-                .iter()
-                .map(|s| lua.create_string(s).unwrap().into_lua(lua).unwrap())
-                .collect();
-            match cb.call::<Option<String>>(arg_values) {
+            let multi = mlua::MultiValue::from_vec(
+                args.iter()
+                    .map(|s| lua.create_string(s).unwrap().into_lua(lua).unwrap())
+                    .collect(),
+            );
+            match cb.call::<Option<String>>(multi) {
                 Ok(Some(ref s)) if s == "suppress" || s == "drop" => suppressed = true,
                 Err(e) => eprintln!("Lua error in {} handler: {}", event, e),
                 _ => {}

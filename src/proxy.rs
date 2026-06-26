@@ -12,6 +12,9 @@ enum Message {
 }
 
 pub fn run(shell: &str, registry: EventRegistry, lua: &Lua) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let _raw = RawModeGuard::enable();
+
     let pty_system = NativePtySystem::default();
     let size = get_terminal_size();
 
@@ -217,6 +220,34 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(unix)]
+struct RawModeGuard(libc::termios);
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enable() -> Option<Self> {
+        unsafe {
+            let mut orig = std::mem::zeroed::<libc::termios>();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+                return None;
+            }
+            let mut raw = orig;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
+            Some(RawModeGuard(orig))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.0);
+        }
+    }
 }
 
 fn get_hostname() -> String {
