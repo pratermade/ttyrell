@@ -68,9 +68,26 @@ proxy.on("output", function(text)
     table.insert(output_buf, text)
 end)
 
+local function clean_output(raw)
+    -- Normalize \r\n to \n, then simulate terminal overwrite: drop everything
+    -- before each lone \r on the same line (erases echoed input and RPROMPT clearing).
+    local s = raw:gsub("\r\n", "\n")
+    s = s:gsub("[^\n\r]*\r", "")
+    local lines = {}
+    for line in (s .. "\n"):gmatch("([^\n]*)\n") do
+        if line:match("%S") then
+            table.insert(lines, line)
+        end
+    end
+    if #lines > 0 then table.remove(lines) end  -- drop trailing shell prompt
+    return table.concat(lines, "\n")
+end
+
 proxy.on("command_exit", function(exit_code)
-    local response = table.concat(output_buf)
-    append({ type = "output", data = response, exit_code = tonumber(exit_code) })
+    local response = clean_output(table.concat(output_buf))
+    local entry = { type = "output", exit_code = tonumber(exit_code) }
+    if #response > 0 then entry.data = response end
+    append(entry)
     output_buf = {}
 end)
 
