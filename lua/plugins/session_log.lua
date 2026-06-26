@@ -38,36 +38,6 @@ proxy.on("session_start", function(host, shell)
     append({ type = "session_start", host = host, shell = shell })
 end)
 
-local input_buf = {}
-
-proxy.on("input", function(data)
-    for i = 1, #data do
-        local ch = data:sub(i, i)
-        local b = ch:byte()
-        if ch == "\r" or ch == "\n" then
-            local cmd = table.concat(input_buf)
-            if #cmd > 0 then
-                append({ type = "input", data = cmd })
-            end
-            input_buf = {}
-        elseif b == 127 or b == 8 then
-            if #input_buf > 0 then table.remove(input_buf) end
-        elseif b >= 32 then
-            table.insert(input_buf, ch)
-        end
-    end
-end)
-
-local output_buf = {}
-
-proxy.on("command_start", function()
-    output_buf = {}
-end)
-
-proxy.on("output", function(text)
-    table.insert(output_buf, text)
-end)
-
 local function clean_output(raw)
     -- Normalize \r\n to \n, then simulate terminal overwrite: drop everything
     -- before each lone \r on the same line (erases echoed input and RPROMPT clearing).
@@ -83,6 +53,44 @@ local function clean_output(raw)
     return table.concat(lines, "\n")
 end
 
+local input_buf = {}
+local output_buf = {}
+
+local function flush_output()
+    local response = clean_output(table.concat(output_buf))
+    output_buf = {}
+    if #response > 0 then
+        append({ type = "output", data = response })
+    end
+end
+
+proxy.on("input", function(data)
+    for i = 1, #data do
+        local ch = data:sub(i, i)
+        local b = ch:byte()
+        if ch == "\r" or ch == "\n" then
+            flush_output()
+            local cmd = table.concat(input_buf)
+            if #cmd > 0 then
+                append({ type = "input", data = cmd })
+            end
+            input_buf = {}
+        elseif b == 127 or b == 8 then
+            if #input_buf > 0 then table.remove(input_buf) end
+        elseif b >= 32 then
+            table.insert(input_buf, ch)
+        end
+    end
+end)
+
+proxy.on("command_start", function()
+    output_buf = {}
+end)
+
+proxy.on("output", function(text)
+    table.insert(output_buf, text)
+end)
+
 proxy.on("command_exit", function(exit_code)
     local response = clean_output(table.concat(output_buf))
     local entry = { type = "output", exit_code = tonumber(exit_code) }
@@ -92,6 +100,7 @@ proxy.on("command_exit", function(exit_code)
 end)
 
 proxy.on("session_end", function()
+    flush_output()
     append({ type = "session_end" })
     f:close()
 
