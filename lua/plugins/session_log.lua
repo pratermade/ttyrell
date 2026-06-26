@@ -38,16 +38,40 @@ proxy.on("session_start", function(host, shell)
     append({ type = "session_start", host = host, shell = shell })
 end)
 
+local input_buf = {}
+
 proxy.on("input", function(data)
-    append({ type = "input", data = data })
+    for i = 1, #data do
+        local ch = data:sub(i, i)
+        local b = ch:byte()
+        if ch == "\r" or ch == "\n" then
+            local cmd = table.concat(input_buf)
+            if #cmd > 0 then
+                append({ type = "input", data = cmd })
+            end
+            input_buf = {}
+        elseif b == 127 or b == 8 then
+            if #input_buf > 0 then table.remove(input_buf) end
+        elseif b >= 32 then
+            table.insert(input_buf, ch)
+        end
+    end
+end)
+
+local output_buf = {}
+
+proxy.on("command_start", function()
+    output_buf = {}
 end)
 
 proxy.on("output", function(text)
-    append({ type = "output", data = text })
+    table.insert(output_buf, text)
 end)
 
 proxy.on("command_exit", function(exit_code)
-    append({ type = "command_exit", exit_code = tonumber(exit_code) })
+    local response = table.concat(output_buf)
+    append({ type = "output", data = response, exit_code = tonumber(exit_code) })
+    output_buf = {}
 end)
 
 proxy.on("session_end", function()
@@ -74,9 +98,8 @@ proxy.on("session_end", function()
         "Be concise — a short paragraph is ideal.\n\n" ..
         "The log is JSONL. Each line has a 'type' field:\n" ..
         "  session_start — host and shell at proxy launch\n" ..
-        "  input         — keystrokes/lines sent to the shell\n" ..
-        "  output        — text received from the shell/remote\n" ..
-        "  command_exit  — exit code of a completed command\n" ..
+        "  input         — full command line entered by the user\n" ..
+        "  output        — full terminal output for a completed command, includes exit_code\n" ..
         "  session_end   — proxy is shutting down\n\n" ..
         log_text
     )
