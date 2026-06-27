@@ -59,6 +59,19 @@ local llm = require("llm")
 -- })
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- ── Work Journal ─────────────────────────────────────────────────────────────
+-- Uncomment to publish journal entries to an Obsidian vault as daily notes.
+-- Each session creates or appends to <vault>/<dir>/YYYY-MM-DD.md.
+--
+-- JOURNAL_OBSIDIAN_VAULT = os.getenv("HOME") .. "/Documents/MyVault"
+-- JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory within the vault (default)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ── AI context window ─────────────────────────────────────────────────────────
+-- Number of recent output lines sent as context for #ai: queries (default 64).
+-- AI_CONTEXT_LINES = 64
+-- ─────────────────────────────────────────────────────────────────────────────
+
 -- Set the terminal window/tab title to "ttyrell" so it's clear the proxy is active
 proxy.on("session_start", function()
     proxy.inject_output("\27]0;ttyrell\7")

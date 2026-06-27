@@ -146,14 +146,26 @@ Log (JSONL -- input = command typed, output = shell response):\n\
         local tasks, err = llm.query(__journal_prompt__)
         if not tasks then return end
 
-        local date_str = os.date('%Y-%m-%d %H:%M')
-        local entry = '## ' .. date_str .. ' -- ' .. __journal_duration__ .. '\n\n'
-                   .. tasks:gsub('%s*$', '') .. '\n\n---\n\n'
+        local tasks_clean = tasks:gsub('%s*$', '')
+        local date_str    = os.date('%Y-%m-%d %H:%M')
 
+        -- Main journal file (full date + time heading)
+        local entry = '## ' .. date_str .. ' -- ' .. __journal_duration__ .. '\n\n'
+                   .. tasks_clean .. '\n\n---\n\n'
         local f = io.open(__journal_path__, 'a')
-        if f then
-            f:write(entry)
-            f:close()
+        if f then f:write(entry); f:close() end
+
+        -- Obsidian daily note (time-only heading; date is the filename)
+        if JOURNAL_OBSIDIAN_VAULT then
+            local sub_dir = JOURNAL_OBSIDIAN_DIR or 'Work Journal'
+            local vault_dir = JOURNAL_OBSIDIAN_VAULT .. '/' .. sub_dir
+            os.execute('mkdir -p ' .. vault_dir:gsub(' ', '\\ '))
+
+            local daily_file = vault_dir .. '/' .. os.date('%Y-%m-%d') .. '.md'
+            local obs_entry  = '## ' .. os.date('%H:%M') .. ' -- ' .. __journal_duration__ .. '\n\n'
+                            .. tasks_clean .. '\n\n---\n\n'
+            local of = io.open(daily_file, 'a')
+            if of then of:write(obs_entry); of:close() end
         end
     ").exec().map_err(|e| anyhow::anyhow!("journal lua: {}", e))?;
 
