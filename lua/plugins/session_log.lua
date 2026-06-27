@@ -55,6 +55,7 @@ end
 
 local input_buf = {}
 local output_buf = {}
+local tab_pending = false  -- set when Tab is pressed, cleared by next output chunk
 
 local function flush_output()
     local response = clean_output(table.concat(output_buf))
@@ -65,13 +66,16 @@ local function flush_output()
 end
 
 -- At Enter time, try to recover the full command (including tab completions) from
--- the terminal echo. Tab completion causes zsh to redraw the current line via \r,
--- so the last \r-preceded segment in output_buf is the completed command line.
+-- the terminal echo. With syntax-highlighting or other ZLE widgets, zsh redraws the
+-- current line via \r; the last \r-preceded segment is the completed command line.
 local function get_cmd_from_output()
     local after_cr = table.concat(output_buf):match(".*\r([^\r\n]+)$")
     if not after_cr then return "" end
+    -- Strip prompt prefix if present
     local cmd = after_cr:match(".*[%%$#]%s+(.+)$") or after_cr:match(".*[%%$#](.+)$")
-    return cmd and cmd:match("^%s*(.-)%s*$") or ""
+    if cmd then return cmd:match("^%s*(.-)%s*$") or "" end
+    -- No prompt chars found (prompt was ANSI-stripped): use content directly
+    return after_cr:match("^%s*(.-)%s*$") or ""
 end
 
 proxy.on("input", function(data)
@@ -86,6 +90,9 @@ proxy.on("input", function(data)
                 append({ type = "input", data = cmd })
             end
             input_buf = {}
+            tab_pending = false
+        elseif b == 9 then  -- Tab
+            tab_pending = true
         elseif b == 127 or b == 8 then
             if #input_buf > 0 then table.remove(input_buf) end
         elseif b >= 32 then
@@ -100,6 +107,41 @@ end)
 
 proxy.on("output", function(text)
     table.insert(output_buf, text)
+
+    if tab_pending then
+        tab_pending = false
+        if not text:find("[\r\n]") then
+            -- No line reset: zsh appended or replaced the current word via ANSI cursor
+            -- movement (stripped). Figure out what the completion produced and patch
+            -- input_buf so the logged command includes the completed text.
+            local typed   = table.concat(input_buf)
+            local trimmed = text:match("^%s*(.-)%s*$") or text
+            if trimmed:sub(1, #typed) == typed then
+                -- Output starts with everything typed so far → it's the full command.
+                input_buf = {}
+                for ch in text:gmatch(".") do
+                    if ch:byte() >= 32 then table.insert(input_buf, ch) end
+                end
+            else
+                local last_word = typed:match("[^%s]*$") or typed
+                if trimmed:sub(1, #last_word) == last_word then
+                    -- Output starts with the current word → full-word replacement.
+                    local before = typed:sub(1, #typed - #last_word)
+                    input_buf = {}
+                    for ch in (before .. text):gmatch(".") do
+                        if ch:byte() >= 32 then table.insert(input_buf, ch) end
+                    end
+                else
+                    -- Output is just the suffix → append.
+                    for ch in text:gmatch(".") do
+                        if ch:byte() >= 32 then table.insert(input_buf, ch) end
+                    end
+                end
+            end
+        end
+        -- If text has \r or \n, get_cmd_from_output() at Enter time handles it.
+    end
+
     -- Flush as soon as the shell prompt appears so output lands in the log
     -- immediately after a command finishes, not on the next keypress.
     -- Prompts are drawn after \r and end with "% ", "$ ", or "# ".
