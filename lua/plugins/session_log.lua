@@ -8,6 +8,9 @@
 
 if TTYRELL_MODE == "summarize" then return end
 
+local _ok_sg, _sg = pcall(require, "secret_guard")
+local sanitize = (_ok_sg and _sg and _sg.sanitize) or function(t) return t end
+
 local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
 if home == "" then
     print("[session_log] HOME not set; logging disabled")
@@ -28,6 +31,7 @@ if not f then
 end
 
 local function append(entry)
+    if entry.data then entry.data = sanitize(entry.data) end
     entry.t = os.date("!%Y-%m-%dT%H:%M:%SZ")
     local ok, line = pcall(proxy.json_encode, entry)
     if ok then
