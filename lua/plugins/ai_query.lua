@@ -22,7 +22,8 @@ proxy.on("input", function(data)
                     if err then
                         proxy.inject_output("[ai] error: " .. err .. "\r\n")
                     else
-                        proxy.inject_output("[ai] " .. response .. "\r\n")
+                        local formatted = response:gsub("\n", "\r\n")
+                        proxy.inject_output("[ai] " .. formatted .. "\r\n")
                     end
                 end
             end
