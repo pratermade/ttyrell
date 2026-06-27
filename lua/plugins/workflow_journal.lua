@@ -4,7 +4,13 @@
 -- that asks the LLM to group commands into named tasks, then appends the result
 -- to a running journal file.
 --
--- Journal: ~/.local/share/ttyrell/journal.md
+-- ── Settings ─────────────────────────────────────────────────────────────────
+-- Uncomment and edit any of these to customize behaviour:
+--
+-- JOURNAL_OBSIDIAN_VAULT = os.getenv("HOME") .. "/Documents/MyVault"
+-- JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
+--
+-- ─────────────────────────────────────────────────────────────────────────────
 
 if TTYRELL_MODE then return end  -- skip in background modes
 
