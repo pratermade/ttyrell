@@ -6,6 +6,8 @@
 -- Log:     ~/.local/share/ttyrell/sessions/YYYY-MM-DD_HH-MM-SS.jsonl
 -- Summary: ~/.local/share/ttyrell/summaries/YYYY-MM-DD_HH-MM-SS.txt
 
+if TTYRELL_MODE == "summarize" then return end
+
 local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
 if home == "" then
     print("[session_log] HOME not set; logging disabled")
@@ -164,43 +166,17 @@ proxy.on("session_end", function()
     append({ type = "session_end" })
     f:close()
 
-    -- Summarize via LLM if a provider is configured
+    -- Kick off summarization in a background process so the user gets their
+    -- prompt back immediately. The child re-invokes ttyrell in --summarize mode,
+    -- which loads init.lua (for LLM config) and calls llm.query(), then exits.
     local ok, llm = pcall(require, "llm")
     if not (ok and llm) then return end
 
-    local rf = io.open(session_path, "r")
-    if not rf then return end
-    local log_text = rf:read("*a")
-    rf:close()
-
-    if #log_text == 0 then return end
-
-    proxy.inject_output("\r\n[session_log] summarizing session...\r\n")
-
-    local summary, serr = llm.query(
-        "Summarize this terminal session log in plain English. " ..
-        "Note what machine(s) were used (look for ssh commands and remote prompts), " ..
-        "what was accomplished, and highlight any errors or non-zero exit codes. " ..
-        "Be concise — a short paragraph is ideal.\n\n" ..
-        "The log is JSONL. Each line has a 'type' field:\n" ..
-        "  session_start — host and shell at proxy launch\n" ..
-        "  input         — full command line entered by the user\n" ..
-        "  output        — full terminal output for a completed command, includes exit_code\n" ..
-        "  session_end   — proxy is shutting down\n\n" ..
-        log_text
+    local summary_path = base_dir .. "/summaries/" .. stamp .. ".txt"
+    local bin = (TTYRELL_BIN or "ttyrell"):gsub("'", "")
+    proxy.spawn(string.format("'%s' --summarize '%s' '%s'",
+        bin, session_path, summary_path))
+    proxy.inject_output(
+        "\r\n[session_log] summarizing in background → summaries/" .. stamp .. ".txt\r\n"
     )
-
-    if serr then
-        proxy.inject_output("[session_log] summary error: " .. serr .. "\r\n")
-        return
-    end
-
-    local sf = io.open(base_dir .. "/summaries/" .. stamp .. ".txt", "w")
-    if sf then
-        sf:write(summary .. "\n")
-        sf:close()
-        proxy.inject_output(
-            "[session_log] summary → summaries/" .. stamp .. ".txt\r\n"
-        )
-    end
 end)

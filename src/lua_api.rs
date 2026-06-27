@@ -137,6 +137,20 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry)> {
     })?;
     proxy_table.set("json_decode", json_decode)?;
 
+    // proxy.spawn(cmd) — run a shell command in the background (non-blocking)
+    let spawn_fn = lua.create_function(|_lua, cmd: String| {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(mlua::Error::external)?;
+        Ok(())
+    })?;
+    proxy_table.set("spawn", spawn_fn)?;
+
     // proxy.config.get(key) — placeholder for v0.3
     let config_table = lua.create_table()?;
     let get_fn = lua.create_function(
