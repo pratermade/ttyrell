@@ -16,13 +16,13 @@ end
 -- ── LLM provider ─────────────────────────────────────────────────────────────
 -- Uncomment one block and set your values, or write your own provider table.
 --
--- local llm = require("llm")
+local llm = require("llm")
 --
--- -- Local llama-server (OpenAI-compatible, no auth needed):
--- llm.setup({
---     endpoint = "http://localhost:8083/v1/chat/completions",
---     model    = "default",
--- })
+-- Local llama-server (OpenAI-compatible, no auth needed):
+ llm.setup({
+     endpoint = "http://mint.pratermade.com:8083/v1/chat/completions",
+     model    = "default",
+ })
 --
 -- -- OpenAI:
 -- llm.setup({
@@ -58,6 +58,11 @@ end
 --     end,
 -- })
 -- ─────────────────────────────────────────────────────────────────────────────
+
+-- Set the terminal window/tab title to "ttyrell" so it's clear the proxy is active
+proxy.on("session_start", function()
+    proxy.inject_output("\27]0;ttyrell\7")
+end)
 
 -- Built-in plugins (only loaded if the file exists)
 local plugins = base .. "/plugins"
