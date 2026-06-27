@@ -8,10 +8,16 @@ enum Message {
     PtyEvents(Vec<OscEvent>),
     PtyOutput(String),
     StdinData(Vec<u8>),
+    SendInput(Vec<u8>),
     Eof,
 }
 
-pub fn run(shell: &str, registry: EventRegistry, lua: &Lua) -> anyhow::Result<()> {
+pub fn run(
+    shell: &str,
+    registry: EventRegistry,
+    lua: &Lua,
+    send_input_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
     let _raw = RawModeGuard::enable();
 
@@ -50,6 +56,16 @@ pub fn run(shell: &str, registry: EventRegistry, lua: &Lua) -> anyhow::Result<()
     let _ = registry.fire(lua, "session_start", vec![hostname, shell.to_string()]);
 
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Message>();
+
+    // Forward proxy.send_input() calls into the main message loop
+    let send_input_fwd_tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(bytes) = send_input_rx.recv() {
+            if send_input_fwd_tx.send(Message::SendInput(bytes)).is_err() {
+                break;
+            }
+        }
+    });
 
     // --- PTY output thread: reads PTY, parses OSC, forwards to stdout and main loop ---
     let pty_tx = msg_tx.clone();
@@ -158,6 +174,10 @@ pub fn run(shell: &str, registry: EventRegistry, lua: &Lua) -> anyhow::Result<()
                     }
                     let _ = writer.flush();
                 }
+            }
+            Ok(Message::SendInput(bytes)) => {
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
             }
             Ok(Message::Eof) | Err(_) => break,
         }

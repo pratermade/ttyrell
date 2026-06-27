@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
         )
     });
 
-    let (lua, registry) = lua_api::init_lua()
+    let (lua, registry, send_input_rx) = lua_api::init_lua()
         .map_err(|e| anyhow::anyhow!("Lua init failed: {}", e))?;
 
     // Expose the binary path so Lua can re-invoke it for background tasks
@@ -65,12 +65,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some((log_path, out_path)) = summarize_args {
+        drop(send_input_rx);
         return run_summarize(&lua, &log_path, &out_path);
     }
 
     // Run the PTY proxy
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    proxy::run(&shell, registry, &lua)?;
+    proxy::run(&shell, registry, &lua, send_input_rx)?;
 
     Ok(())
 }

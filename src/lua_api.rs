@@ -67,11 +67,13 @@ impl EventRegistry {
 
 /// Initialize the Lua environment and expose the `proxy` API table.
 ///
-/// Returns the Lua state and the event registry.
-pub fn init_lua() -> LuaResult<(Lua, EventRegistry)> {
+/// Returns the Lua state, the event registry, and a receiver for PTY input
+/// injected by Lua via `proxy.send_input()`.
+pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Vec<u8>>)> {
     let lua = Lua::new();
     let registry = EventRegistry::new();
     let registry_clone = registry.clone();
+    let (send_input_tx, send_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     // Expose `proxy` global table
     let proxy_table = lua.create_table()?;
@@ -137,6 +139,15 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry)> {
     })?;
     proxy_table.set("json_decode", json_decode)?;
 
+    // proxy.send_input(text) — write text to the PTY as if the user typed it
+    let send_input_fn = lua.create_function(move |_lua, text: String| {
+        send_input_tx
+            .send(text.into_bytes())
+            .map_err(mlua::Error::external)?;
+        Ok(())
+    })?;
+    proxy_table.set("send_input", send_input_fn)?;
+
     // proxy.spawn(cmd) — run a shell command in the background (non-blocking)
     let spawn_fn = lua.create_function(|_lua, cmd: String| {
         std::process::Command::new("sh")
@@ -161,5 +172,5 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry)> {
 
     lua.globals().set("proxy", proxy_table)?;
 
-    Ok((lua, registry))
+    Ok((lua, registry, send_input_rx))
 }
