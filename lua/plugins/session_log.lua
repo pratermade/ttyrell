@@ -64,13 +64,24 @@ local function flush_output()
     end
 end
 
+-- At Enter time, try to recover the full command (including tab completions) from
+-- the terminal echo. Tab completion causes zsh to redraw the current line via \r,
+-- so the last \r-preceded segment in output_buf is the completed command line.
+local function get_cmd_from_output()
+    local after_cr = table.concat(output_buf):match(".*\r([^\r\n]+)$")
+    if not after_cr then return "" end
+    local cmd = after_cr:match(".*[%%$#]%s+(.+)$") or after_cr:match(".*[%%$#](.+)$")
+    return cmd and cmd:match("^%s*(.-)%s*$") or ""
+end
+
 proxy.on("input", function(data)
     for i = 1, #data do
         local ch = data:sub(i, i)
         local b = ch:byte()
         if ch == "\r" or ch == "\n" then
+            local cmd = get_cmd_from_output()
+            if #cmd == 0 then cmd = table.concat(input_buf) end
             flush_output()
-            local cmd = table.concat(input_buf)
             if #cmd > 0 then
                 append({ type = "input", data = cmd })
             end
@@ -89,6 +100,13 @@ end)
 
 proxy.on("output", function(text)
     table.insert(output_buf, text)
+    -- Flush as soon as the shell prompt appears so output lands in the log
+    -- immediately after a command finishes, not on the next keypress.
+    -- Prompts are drawn after \r and end with "% ", "$ ", or "# ".
+    local after_cr = text:match(".*\r([^\r\n]*)$")
+    if after_cr and after_cr:match("[%%$#]%s*$") then
+        flush_output()
+    end
 end)
 
 proxy.on("command_exit", function(exit_code)
