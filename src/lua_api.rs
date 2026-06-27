@@ -97,7 +97,7 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry)> {
     let http_post = lua.create_function(
         |_lua, (url, body, headers): (String, String, Option<mlua::Table>)| {
             let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(90))
                 .build();
             let mut req = agent.post(&url).set("Content-Type", "application/json");
             if let Some(h) = headers {
