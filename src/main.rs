@@ -6,11 +6,19 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // --summarize <log_path> <out_path>
-    // Re-uses the Lua/LLM stack to summarize a session log in a background process.
     let summarize_args = args.iter().position(|a| a == "--summarize").map(|pos| {
         (
             args.get(pos + 1).cloned().unwrap_or_default(),
             args.get(pos + 2).cloned().unwrap_or_default(),
+        )
+    });
+
+    // --journal <log_path> <journal_path> <duration_secs>
+    let journal_args = args.iter().position(|a| a == "--journal").map(|pos| {
+        (
+            args.get(pos + 1).cloned().unwrap_or_default(),
+            args.get(pos + 2).cloned().unwrap_or_default(),
+            args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
         )
     });
 
@@ -27,6 +35,9 @@ fn main() -> anyhow::Result<()> {
 
     if summarize_args.is_some() {
         lua.globals().set("TTYRELL_MODE", "summarize")
+            .map_err(|e| anyhow::anyhow!("Failed to set TTYRELL_MODE: {}", e))?;
+    } else if journal_args.is_some() {
+        lua.globals().set("TTYRELL_MODE", "journal")
             .map_err(|e| anyhow::anyhow!("Failed to set TTYRELL_MODE: {}", e))?;
     }
 
@@ -69,9 +80,82 @@ fn main() -> anyhow::Result<()> {
         return run_summarize(&lua, &log_path, &out_path);
     }
 
+    if let Some((log_path, journal_path, duration_secs)) = journal_args {
+        drop(send_input_rx);
+        return run_journal(&lua, &log_path, &journal_path, duration_secs);
+    }
+
     // Run the PTY proxy
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     proxy::run(&shell, registry, &lua, send_input_rx)?;
+
+    Ok(())
+}
+
+fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_secs: u64) -> anyhow::Result<()> {
+    let log = std::fs::read_to_string(log_path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", log_path, e))?;
+
+    if log.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mins = duration_secs / 60;
+    let secs = duration_secs % 60;
+    let duration_str = if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    };
+
+    // Build the full prompt in Rust to avoid embedding markdown syntax in Lua source
+    let prompt = format!(
+        "You are writing a developer's work journal. Given this terminal session log \
+(JSONL format), identify distinct tasks and summarize each concisely in markdown.\n\
+\n\
+Output ONLY task sections -- no preamble, no date header, no closing remarks:\n\
+\n\
+### Task Name\n\
+- Key outcome or finding\n\
+- Additional detail (omit if redundant)\n\
+\n\
+Rules:\n\
+- Name tasks with action verbs: Fixed auth bug, Deployed API, Set up database\n\
+- Summarize outcomes, not steps -- do not list every command typed\n\
+- Group closely related commands into one task\n\
+- Skip trivial commands: cd, ls, pwd, echo, clear, history\n\
+- If errors were encountered and resolved, note it in one bullet\n\
+- If a task was abandoned with no result, omit it\n\
+- Session duration: {duration_str}\n\
+\n\
+Log (JSONL -- input = command typed, output = shell response):\n\
+{log}"
+    );
+
+    lua.globals().set("__journal_prompt__", prompt)
+        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
+    lua.globals().set("__journal_path__", journal_path)
+        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
+    lua.globals().set("__journal_duration__", duration_str)
+        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
+
+    lua.load(r"
+        local ok, llm = pcall(require, 'llm')
+        if not (ok and llm) then return end
+
+        local tasks, err = llm.query(__journal_prompt__)
+        if not tasks then return end
+
+        local date_str = os.date('%Y-%m-%d %H:%M')
+        local entry = '## ' .. date_str .. ' -- ' .. __journal_duration__ .. '\n\n'
+                   .. tasks:gsub('%s*$', '') .. '\n\n---\n\n'
+
+        local f = io.open(__journal_path__, 'a')
+        if f then
+            f:write(entry)
+            f:close()
+        end
+    ").exec().map_err(|e| anyhow::anyhow!("journal lua: {}", e))?;
 
     Ok(())
 }

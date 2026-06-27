@@ -6,7 +6,7 @@
 -- Log:     ~/.local/share/ttyrell/sessions/YYYY-MM-DD_HH-MM-SS.jsonl
 -- Summary: ~/.local/share/ttyrell/summaries/YYYY-MM-DD_HH-MM-SS.txt
 
-if TTYRELL_MODE == "summarize" then return end
+if TTYRELL_MODE then return end  -- skip in all background modes (summarize, journal, …)
 
 local _ok_sg, _sg = pcall(require, "secret_guard")
 local sanitize = (_ok_sg and _sg and _sg.sanitize) or function(t) return t end
@@ -23,6 +23,7 @@ os.execute("mkdir -p " .. base_dir .. "/summaries")
 
 local stamp = os.date("%Y-%m-%d_%H-%M-%S")
 local session_path = base_dir .. "/sessions/" .. stamp .. ".jsonl"
+CURRENT_SESSION_LOG = session_path  -- exposed for other plugins (e.g. workflow_journal)
 
 local f, ferr = io.open(session_path, "w")
 if not f then
