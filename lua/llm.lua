@@ -1,12 +1,12 @@
 -- llm.lua — LLM provider abstraction
 --
--- Call llm.setup({...}) in init.lua to configure a provider.
+-- Plugins call llm.query(prompt, cfg, context) where cfg is a provider table
+-- from the LLM palette defined in init.lua (e.g. LLM.local_llama).
 -- Defaults to the OpenAI-compatible chat completions format.
--- Override headers(), build_request(), or parse_response() for other APIs.
+-- Override headers(), build_request(), or parse_response() in the provider
+-- table for other APIs.
 
 local M = {}
-
-local active = nil
 
 local function default_headers(cfg)
     local h = {}
@@ -16,12 +16,13 @@ local function default_headers(cfg)
     return h
 end
 
-local function default_build_request(cfg, prompt)
+local function default_build_request(cfg, prompt, context)
+    local user_content = context and (prompt .. "\n\n" .. context) or prompt
     return {
         model    = cfg.model or "default",
         messages = {
             { role = "system", content = cfg.system_prompt },
-            { role = "user",   content = prompt },
+            { role = "user",   content = user_content },
         },
         stream = false,
     }
@@ -36,43 +37,41 @@ local function default_parse_response(parsed)
     return (msg and msg.content) or "", nil
 end
 
---- Configure the active provider.
---
--- Required fields:
---   endpoint  string  Full URL, e.g. "http://localhost:8083/v1/chat/completions"
---   model     string  Model name passed in the request body
---
--- Optional fields:
---   api_key       string    Added as "Authorization: Bearer <key>" header
---   system_prompt string    Default: "You are a helpful terminal assistant. Be concise."
---
--- Override functions (all receive cfg as first arg):
---   headers(cfg)              -> table of header key/value pairs
---   build_request(cfg, prompt) -> table serialised as JSON request body
---   parse_response(parsed)    -> response_text, err_or_nil
-function M.setup(opts)
-    active = opts
-    active.system_prompt  = active.system_prompt  or "You are a helpful terminal assistant. Be concise."
-    active.headers        = active.headers        or default_headers
-    active.build_request  = active.build_request  or default_build_request
-    active.parse_response = active.parse_response or default_parse_response
+local function resolve(opts)
+    return {
+        endpoint       = opts.endpoint,
+        model          = opts.model,
+        api_key        = opts.api_key,
+        system_prompt  = opts.system_prompt  or "You are a helpful terminal assistant. Be concise.",
+        headers        = opts.headers        or default_headers,
+        build_request  = opts.build_request  or default_build_request,
+        parse_response = opts.parse_response or default_parse_response,
+    }
 end
 
---- Send a prompt to the configured provider.
+--- Send a prompt to an LLM provider.
+--
+-- prompt   string    The instruction or question.
+-- cfg      table     Provider config from the LLM palette (e.g. LLM.local_llama).
+-- context  string|nil  Optional data blob (log, terminal output, etc.) appended
+--                      after the prompt in the user message.
+--
 -- Returns: response_text, nil   on success
 --          nil, error_string    on failure
-function M.query(prompt)
-    if not active then
-        return nil, "no LLM provider configured — call llm.setup() in init.lua"
+function M.query(prompt, cfg, context)
+    if not cfg then
+        return nil, "no LLM provider given — pass a provider from the LLM palette (e.g. LLM.local_llama)"
     end
 
-    local ok_enc, body = pcall(proxy.json_encode, active.build_request(active, prompt))
+    local provider = resolve(cfg)
+
+    local ok_enc, body = pcall(proxy.json_encode, provider.build_request(provider, prompt, context))
     if not ok_enc then
         return nil, "encode error: " .. tostring(body)
     end
 
-    local headers = active.headers(active)
-    local ok_http, status, resp = pcall(proxy.http_post, active.endpoint, body, headers)
+    local headers = provider.headers(provider)
+    local ok_http, status, resp = pcall(proxy.http_post, provider.endpoint, body, headers)
     if not ok_http then
         return nil, "connection error: " .. tostring(status)
     end
@@ -85,7 +84,7 @@ function M.query(prompt)
         return nil, "decode error: " .. tostring(parsed)
     end
 
-    return active.parse_response(parsed)
+    return provider.parse_response(parsed)
 end
 
 return M

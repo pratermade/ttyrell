@@ -7,8 +7,33 @@
 -- ── Settings ─────────────────────────────────────────────────────────────────
 -- Uncomment and edit any of these to customize behaviour:
 --
--- JOURNAL_OBSIDIAN_VAULT = os.getenv("HOME") .. "/Documents/MyVault"
--- JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
+JOURNAL_OBSIDIAN_VAULT = "/Volumes/home/pratersm/obsidian/notes"
+JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
+--
+-- Prompt sent to the LLM when writing journal entries.
+-- Edit this to change what the AI focuses on or how it formats output.
+JOURNAL_PROMPT = [[
+You are writing a developer's/system administrator's work journal. Given this terminal session log
+(JSONL format), identify distinct tasks and summarize each concisely in markdown.
+
+Output ONLY task sections -- no preamble, no date header, no closing remarks:
+
+### Task Name
+- Key outcome or finding
+- Host task was performed on
+- Additional detail (omit if redundant)
+
+Rules:
+- Name tasks with action verbs: Fixed auth bug, Deployed API, Set up database
+- Summarize outcomes, not steps -- do not list every command typed
+- Group closely related commands into one task
+- Skip trivial commands: cd, ls, pwd, echo, clear, history
+- If errors were encountered and resolved, note it in one bullet
+- If a task was abandoned with no result, omit it]]
+--
+-- LLM provider for journal entries — pick from the palette defined in init.lua:
+JOURNAL_LLM = LLM.local_llama
+-- JOURNAL_LLM = LLM.claude
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 

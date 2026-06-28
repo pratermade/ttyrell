@@ -108,31 +108,7 @@ fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_sec
         format!("{}s", secs)
     };
 
-    // Build the full prompt in Rust to avoid embedding markdown syntax in Lua source
-    let prompt = format!(
-        "You are writing a developer's work journal. Given this terminal session log \
-(JSONL format), identify distinct tasks and summarize each concisely in markdown.\n\
-\n\
-Output ONLY task sections -- no preamble, no date header, no closing remarks:\n\
-\n\
-### Task Name\n\
-- Key outcome or finding\n\
-- Additional detail (omit if redundant)\n\
-\n\
-Rules:\n\
-- Name tasks with action verbs: Fixed auth bug, Deployed API, Set up database\n\
-- Summarize outcomes, not steps -- do not list every command typed\n\
-- Group closely related commands into one task\n\
-- Skip trivial commands: cd, ls, pwd, echo, clear, history\n\
-- If errors were encountered and resolved, note it in one bullet\n\
-- If a task was abandoned with no result, omit it\n\
-- Session duration: {duration_str}\n\
-\n\
-Log (JSONL -- input = command typed, output = shell response):\n\
-{log}"
-    );
-
-    lua.globals().set("__journal_prompt__", prompt)
+    lua.globals().set("__journal_log__", log)
         .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
     lua.globals().set("__journal_path__", journal_path)
         .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
@@ -143,7 +119,12 @@ Log (JSONL -- input = command typed, output = shell response):\n\
         local ok, llm = pcall(require, 'llm')
         if not (ok and llm) then return end
 
-        local tasks, err = llm.query(__journal_prompt__)
+        if not JOURNAL_PROMPT then
+            io.stderr:write('[journal] JOURNAL_PROMPT not set - is workflow_journal.lua loaded?\n')
+            return
+        end
+        local prompt = JOURNAL_PROMPT .. '\n- Session duration: ' .. __journal_duration__
+        local tasks, err = llm.query(prompt, JOURNAL_LLM, __journal_log__)
         if not tasks then return end
 
         local tasks_clean = tasks:gsub('%s*$', '')

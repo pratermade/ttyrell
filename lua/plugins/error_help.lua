@@ -5,6 +5,10 @@
 --
 -- NOTE: last_cmd is populated by shell integration (shell/integration.*).
 -- Without it the ignore list is a no-op but LLM assistance still works.
+--
+-- LLM provider for error help — pick from the palette defined in init.lua:
+ERROR_HELP_LLM = LLM.local_llama
+-- ERROR_HELP_LLM = LLM.claude
 
 local ignore_set = {}
 for _, cmd in ipairs({ "grep", "diff", "test", "false", "[", ":" }) do
@@ -21,7 +25,7 @@ end
 -- Rolling buffer of recent terminal output — gives the LLM context about
 -- what was running when the failure occurred
 local recent_lines = {}
-local MAX_LINES = 40
+local MAX_LINES = 64
 
 proxy.on("output", function(text)
     for line in (text .. "\n"):gmatch("([^\n]*)\n") do
@@ -48,14 +52,12 @@ proxy.on("command_exit", function(exit_code)
     end
 
     local context = table.concat(recent_lines, "\n")
-    local response, err = llm.query(
-        string.format(
-            "A shell command just exited with code %d.\n" ..
-            "Recent terminal output for context:\n\n%s\n\n" ..
-            "In 1-2 sentences: what likely caused this and what should I check?",
-            code, context
-        )
+    local prompt  = string.format(
+        "A shell command just exited with code %d.\n" ..
+        "In 1-2 sentences: what likely caused this and what should I check?",
+        code
     )
+    local response, err = llm.query(prompt, ERROR_HELP_LLM, context)
 
     if err then
         proxy.inject_output("\r\n[error_help] " .. err .. "\r\n")

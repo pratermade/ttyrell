@@ -5,6 +5,10 @@
 -- "EXEC: <cmd>" — ttyrell shows it and asks [y/N] before running anything.
 --
 -- Set AI_CONTEXT_LINES in init.lua to override the context window (default 64).
+--
+-- LLM provider for AI queries — pick from the palette defined in init.lua:
+AI_QUERY_LLM = LLM.local_llama
+-- AI_QUERY_LLM = LLM.claude
 
 local llm = require("llm")
 
@@ -79,7 +83,7 @@ proxy.on("input", function(data)
                         prompt = prompt .. "Question: " .. question
                     end
 
-                    local response, err = llm.query(prompt)
+                    local response, err = llm.query(prompt, AI_QUERY_LLM)
                     if err then
                         proxy.inject_output("[ai] error: " .. err .. "\r\n")
                     else
