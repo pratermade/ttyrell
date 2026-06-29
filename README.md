@@ -1,7 +1,5 @@
 # ttyrell
 
-[![CI](https://github.com/your-repo/ttyrell/actions/workflows/ci.yml/badge.svg)](https://github.com/your-repo/ttyrell/actions/workflows/ci.yml)
-
 A transparent PTY proxy with Lua scripting, session logging, and LLM integration. It sits between your terminal emulator and your shell and is completely invisible unless a plugin acts on something.
 
 ```
@@ -178,19 +176,51 @@ You do **not** need `ttyrell` installed on the remote machine. Only the shell in
 
 ## LLM setup
 
-Edit `lua/init.lua` (in your config directory) and uncomment a provider block:
+Edit `lua/init.lua` (in your config directory) to define your LLM providers in the `LLM` palette table. Plugins pick from this palette by name, so you can use different providers for different plugins.
 
 ```lua
-local llm = require("llm")
-
--- Local llama-server (no auth, OpenAI-compatible):
-llm.setup({
-    endpoint = "http://localhost:8083/v1/chat/completions",
-    model    = "default",
-})
+LLM = {
+    local_llama = {
+        endpoint = "http://localhost:8083/v1/chat/completions",
+        model    = "default",
+    },
+    claude = {
+        endpoint = "https://api.anthropic.com/v1/messages",
+        api_key  = os.getenv("ANTHROPIC_API_KEY"),
+        model    = "claude-opus-4-8",
+        headers  = function(cfg)
+            return {
+                ["x-api-key"]         = cfg.api_key,
+                ["anthropic-version"] = "2023-06-01",
+            }
+        end,
+        build_request = function(cfg, prompt, context)
+            return {
+                model      = cfg.model,
+                max_tokens = 1024,
+                system     = cfg.system_prompt,
+                messages   = {{ role = "user", content = prompt .. (context and "\n\n" .. context or "") }},
+            }
+        end,
+        parse_response = function(parsed)
+            if not parsed.content or #parsed.content == 0 then return nil, "no content" end
+            return parsed.content[1].text, nil
+        end,
+    },
+}
 ```
 
-See [docs/llm-providers.md](docs/llm-providers.md) for OpenAI, Anthropic, Ollama, and custom provider configuration.
+Each plugin file declares which provider it uses at the top:
+
+```lua
+-- lua/plugins/ai_query.lua
+AI_QUERY_LLM = LLM.local_llama
+
+-- lua/plugins/workflow_journal.lua
+JOURNAL_LLM = LLM.claude
+```
+
+The default provider table format is OpenAI-compatible. Override `headers`, `build_request`, and `parse_response` for APIs that differ (see the Anthropic example above).
 
 ---
 
@@ -202,8 +232,6 @@ Plugins are loaded from `lua/plugins/` at startup. Each is optional — if the f
 
 Writes a full session transcript to `~/.local/share/ttyrell/sessions/YYYY-MM-DD_HH-MM-SS.jsonl`. Captures every input line and every output chunk with timestamps. SSH sessions are captured automatically.
 
-On session end, if an LLM provider is configured, reads the log back, sends it with a structured summary prompt, and writes the result to `~/.local/share/ttyrell/summaries/`.
-
 ### ai_query
 
 Type `#ai: <question>` at any prompt. The line is intercepted, sent to the LLM, and the response is printed inline. The line is never forwarded to the shell.
@@ -214,13 +242,36 @@ $ #ai: why is my Dockerfile build slow
 [ai] The most common cause is a large build context...
 ```
 
-Requires an LLM provider to be configured in `init.lua`.
+If the LLM suggests a shell command it appends `EXEC: <cmd>` — ttyrell shows it and asks `[y/N]` before running anything.
+
+Configure the provider in the plugin file:
+```lua
+AI_QUERY_LLM = LLM.local_llama
+```
 
 ### error_help
 
-On any non-zero exit code, sends the last 40 lines of terminal output to the LLM and prints a specific suggestion. Ignores commands where non-zero is routine: `grep`, `diff`, `test`, `false`, `[`, `:`.
+On any non-zero exit code, sends the last 64 lines of terminal output to the LLM as context and prints a specific suggestion inline. Ignores commands where non-zero is routine: `grep`, `diff`, `test`, `false`, `[`, `:`.
 
-Requires an LLM provider to be configured in `init.lua`.
+Configure the provider in the plugin file:
+```lua
+ERROR_HELP_LLM = LLM.local_llama
+```
+
+### workflow_journal
+
+At session end, spawns a background process that reads the session log, asks the LLM to group commands into named tasks, and appends the result to a running journal file at `~/.local/share/ttyrell/journal.md`.
+
+Optional Obsidian integration writes each entry to a daily note in your vault.
+
+Configure in the plugin file:
+```lua
+JOURNAL_LLM            = LLM.claude
+JOURNAL_OBSIDIAN_VAULT = "/path/to/your/vault"
+JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
+```
+
+The prompt that guides the journal entries is also editable in the plugin file via `JOURNAL_PROMPT` — no Rust rebuild required.
 
 ---
 
@@ -242,7 +293,7 @@ end)
 
 Add `"my_plugin"` to the plugin list in `lua/init.lua`:
 ```lua
-for _, name in ipairs({ "session_log", "ai_query", "error_help", "my_plugin" }) do
+for _, name in ipairs({ "session_log", "ai_query", "error_help", "workflow_journal", "my_plugin" }) do
     try_load(plugins .. "/" .. name)
 end
 ```
@@ -281,9 +332,24 @@ proxy.session_info.pid                    -- ttyrell process ID
 
 ```lua
 local llm = require("llm")
-llm.setup({ endpoint, model, api_key, system_prompt, headers, build_request, parse_response })
-local response, err = llm.query("your prompt")
+
+-- prompt  : the instruction or question
+-- cfg     : a provider table from the LLM palette (e.g. LLM.local_llama)
+-- context : optional data blob appended after the prompt (log output, terminal history, etc.)
+local response, err = llm.query(prompt, cfg, context)
 ```
+
+Provider tables support these fields:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `endpoint` | string | required |
+| `model` | string | required |
+| `api_key` | string | nil |
+| `system_prompt` | string | `"You are a helpful terminal assistant. Be concise."` |
+| `headers(cfg)` | function | Bearer token auth |
+| `build_request(cfg, prompt, context)` | function | OpenAI chat completions format |
+| `parse_response(parsed)` | function | OpenAI choices[0].message.content |
 
 ---
 
@@ -358,11 +424,14 @@ This is expected. Each handler error is caught and printed; it does not crash th
 **init.lua is not loading**
 Check that the file exists at one of the config paths above. The proxy prints `Failed to load init.lua: ...` to stderr on error.
 
-**ai_query / error_help does nothing**
-An LLM provider must be configured. Uncomment and edit the `llm.setup()` block in `init.lua`. Test with `#ai: hello`.
+**ai_query / error_help / workflow_journal does nothing**
+Each plugin needs an LLM provider assigned. Check that the `LLM` palette in `init.lua` has an entry for the provider the plugin references, and that the plugin file sets its `*_LLM` variable. Test with `#ai: hello`.
 
 **Session log is not being created**
 Check that `$HOME` (macOS/Linux) or `%USERPROFILE%` (Windows) is set. Check stderr for `[session_log] cannot open log:` messages.
 
 **Shell integration not firing command_exit**
 Verify `TTYRELL=1` is exported before sourcing the integration script. Check that the script is being sourced, not executed (`source integration.bash`, not `./integration.bash`).
+
+**Journal not writing after session ends**
+Check stderr for `[journal] JOURNAL_PROMPT not set` — this means `workflow_journal.lua` was not loaded. Verify it appears in the plugin list in `init.lua`.
