@@ -1,21 +1,32 @@
 -- ai_query.lua — #ai: prefix handler with optional shell command execution
 --
--- Type "#ai: <question>" and press Enter. The AI sees the last N lines of
--- terminal output as context. If the AI wants to run a command it appends
+-- Type "#ai: <question>" and press Enter. The AI sees recent session
+-- history as context. If the AI wants to run a command it appends
 -- "EXEC: <cmd>" — ttyrell shows it and asks [y/N] before running anything.
 --
--- Set AI_CONTEXT_LINES in init.lua to override the context window (default 64).
+-- ── Context settings ─────────────────────────────────────────────────────────
+-- AI_CONTEXT_COMMANDS: number of recent command/output pairs from the session
+--   log to send as context. Set lower for small local models, higher for cloud.
+--   0 = disabled (falls back to the raw output buffer below).
+-- AI_CONTEXT_LINES: size of the raw output buffer used when AI_CONTEXT_COMMANDS
+--   is 0 or the session log is unavailable. Default: 64.
 --
+-- AI_CONTEXT_COMMANDS = 10
+-- AI_CONTEXT_LINES    = 64
+--
+-- ── LLM provider ─────────────────────────────────────────────────────────────
 -- LLM provider for AI queries — pick from the palette defined in init.lua:
 AI_QUERY_LLM = LLM.local_llama
 -- AI_QUERY_LLM = LLM.claude
+-- ─────────────────────────────────────────────────────────────────────────────
 
 local llm = require("llm")
 
 local CONTEXT_LINES = (type(AI_CONTEXT_LINES) == "number" and AI_CONTEXT_LINES > 0)
     and AI_CONTEXT_LINES or 64
 
--- Rolling buffer of recent output lines (ANSI-stripped by proxy.rs)
+-- Rolling buffer of recent output lines — used when AI_CONTEXT_COMMANDS is 0
+-- or the session log is unavailable.
 local history = {}
 
 proxy.on("tui_start", function()
@@ -35,9 +46,63 @@ proxy.on("output", function(text)
     end
 end)
 
+--- Read the last n command/output pairs from the current session log.
+-- Parses CURRENT_SESSION_LOG (JSONL written by session_log.lua) and returns
+-- a formatted string suitable for LLM context, or nil if unavailable.
+local function read_session_context(n)
+    if n <= 0 then return nil end
+    local log_path = CURRENT_SESSION_LOG
+    if not log_path then return nil end
+
+    local f = io.open(log_path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+
+    -- Walk the JSONL: group output entries under their preceding input entry.
+    local pairs_list = {}
+    local current = nil
+
+    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+        if line ~= "" then
+            local ok, entry = pcall(proxy.json_decode, line)
+            if ok and type(entry) == "table" then
+                if entry.type == "input" and entry.data then
+                    if current then table.insert(pairs_list, current) end
+                    current = { cmd = entry.data, outputs = {}, exit_code = nil }
+                elseif entry.type == "output" and current then
+                    if entry.data then
+                        table.insert(current.outputs, entry.data)
+                    end
+                    if entry.exit_code ~= nil then
+                        current.exit_code = entry.exit_code
+                    end
+                end
+            end
+        end
+    end
+    if current then table.insert(pairs_list, current) end
+
+    if #pairs_list == 0 then return nil end
+
+    -- Take the last n pairs and format them.
+    local start = math.max(1, #pairs_list - n + 1)
+    local parts = {}
+    for i = start, #pairs_list do
+        local p = pairs_list[i]
+        local header = "$ " .. p.cmd
+        if p.exit_code ~= nil and p.exit_code ~= 0 then
+            header = header .. "  (exit " .. tostring(p.exit_code) .. ")"
+        end
+        local output = table.concat(p.outputs, "\n"):match("^%s*(.-)%s*$") or ""
+        table.insert(parts, #output > 0 and (header .. "\n" .. output) or header)
+    end
+
+    return "Recent commands:\n\n" .. table.concat(parts, "\n\n")
+end
+
 -- Set while waiting for the user to answer a permission prompt
 local pending_cmd = nil
-
 local buf = {}
 
 local EXEC_INSTRUCTIONS =
@@ -77,12 +142,18 @@ proxy.on("input", function(data)
                 if #question > 0 then
                     proxy.inject_output("\r\n[ai] thinking...\r\n")
 
+                    -- Prefer structured session-log context; fall back to text buffer.
+                    local n_cmds = (type(AI_CONTEXT_COMMANDS) == "number")
+                        and AI_CONTEXT_COMMANDS or 10
+                    local context = read_session_context(n_cmds)
+                    if not context and #history > 0 then
+                        context = "Recent terminal output:\n```\n" ..
+                            table.concat(history, "\n") .. "\n```"
+                    end
+
                     local prompt = EXEC_INSTRUCTIONS
-                    if #history > 0 then
-                        prompt = prompt ..
-                            "Recent terminal output:\n```\n" ..
-                            table.concat(history, "\n") ..
-                            "\n```\n\nQuestion: " .. question
+                    if context then
+                        prompt = prompt .. context .. "\n\nQuestion: " .. question
                     else
                         prompt = prompt .. "Question: " .. question
                     end
@@ -91,17 +162,14 @@ proxy.on("input", function(data)
                     if err then
                         proxy.inject_output("[ai] error: " .. err .. "\r\n")
                     else
-                        -- Check for EXEC: line at end of response
                         local exec_cmd = response:match("\nEXEC:%s*([^\n]+)%s*$")
                                       or response:match("^EXEC:%s*([^\n]+)%s*$")
                         if exec_cmd then
                             exec_cmd = exec_cmd:match("^%s*(.-)%s*$")
-                            -- Show the non-EXEC part of the response (if any)
                             local body = response:gsub("\n?EXEC:%s*[^\n]+%s*$", ""):gsub("%s*$", "")
                             if #body > 0 then
                                 proxy.inject_output("[ai] " .. body:gsub("\n", "\r\n") .. "\r\n")
                             end
-                            -- Permission prompt — stays on one line, awaits y/N
                             proxy.inject_output("[ai] run: " .. exec_cmd .. " ? [y/N] ")
                             pending_cmd = exec_cmd
                         else
