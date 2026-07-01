@@ -40,10 +40,31 @@ Requires Rust stable. No system Lua installation needed — Lua 5.5 is compiled 
 git clone <repo>
 cd ttyrell
 cargo build --release
-# binary: target/release/ttyrell  (target/release/ttyrell.exe on Windows)
 ```
 
-Copy the binary somewhere on your PATH, then copy `lua/` to your config directory (see [Config file locations](#config-file-locations)).
+The binary is at `target/release/ttyrell` (or `ttyrell.exe` on Windows). **Run it once to launch the setup wizard:**
+
+```
+$ ./target/release/ttyrell
+
+ttyrell installer  v0.3.0
+══════════════════════════════════════════
+
+  This will:
+    • Copy ttyrell to ~/.local/bin/ttyrell
+    • Write Lua config to ~/.config/ttyrell/lua
+    • Create session log directory
+
+  ? Proceed? [Y/n]:
+```
+
+The wizard:
+- Copies the binary to your bin directory and warns if it isn't on `PATH`
+- Prompts for an LLM provider (Local/OpenAI-compatible, OpenAI, Anthropic, or skip)
+- Optionally sets up Obsidian vault integration for `workflow_journal`
+- Offers to add shell integration to your rc file
+
+To re-run the wizard (e.g. to change providers or reinstall): `ttyrell --install`
 
 ---
 
@@ -59,10 +80,10 @@ Open your Ghostty config with `ghostty +open-config` (or `Cmd+,` on macOS), then
 command = /usr/local/bin/ttyrell
 ```
 
-Verify the path first — if you installed from source, use `which ttyrell` and substitute the output:
+Verify the path first — if you used the installer, it's probably `~/.local/bin/ttyrell`:
 
 ```
-command = /Users/you/.cargo/bin/ttyrell
+command = /home/you/.local/bin/ttyrell
 ```
 
 Ghostty natively supports OSC 133 shell integration sequences, so the `command_start`, `command_exit`, and `prompt_start` events work without any extra configuration once you source the [shell integration script](#shell-integration).
@@ -71,22 +92,22 @@ After saving, reload the config with `Cmd+Shift+,` (or restart Ghostty). Open a 
 
 **WezTerm** (`~/.wezterm.lua`):
 ```lua
-config.default_prog = { '/usr/local/bin/ttyrell' }
+config.default_prog = { '/home/you/.local/bin/ttyrell' }
 ```
 
 **Alacritty** (`~/.config/alacritty/alacritty.toml`):
 ```toml
 [shell]
-program = "/usr/local/bin/ttyrell"
+program = "/home/you/.local/bin/ttyrell"
 ```
 
-**iTerm2**: Preferences → Profiles → General → Command → Custom shell → `/usr/local/bin/ttyrell`
+**iTerm2**: Preferences → Profiles → General → Command → Custom shell → `/home/you/.local/bin/ttyrell`
 
 **Windows Terminal** — open `settings.json` and add a new profile:
 ```json
 {
   "name": "ttyrell",
-  "commandline": "C:\\Users\\you\\bin\\ttyrell.exe",
+  "commandline": "C:\\Users\\you\\AppData\\Local\\Programs\\ttyrell.exe",
   "hidden": false
 }
 ```
@@ -110,9 +131,8 @@ This gives you tmux's session management and ttyrell's logging and AI features i
 
 2. Tell tmux to use `ttyrell` as the shell inside each pane. Add to `~/.tmux.conf`:
    ```
-   set -g default-shell /usr/local/bin/ttyrell
+   set -g default-shell /home/you/.local/bin/ttyrell
    ```
-   Verify the path with `which ttyrell` and substitute if different.
 
 3. Kill and reopen your tmux session to pick up the change. New panes will use ttyrell; existing panes will not.
 
@@ -122,9 +142,11 @@ ttyrell reads `$SHELL` to find your real shell, so zsh (or whichever shell you u
 
 ## Shell integration
 
-Shell integration is **optional**. Without it, `session_log`, `ai_query`, and `error_help` all work — you just won't get per-command boundaries or accurate exit codes. Source the integration script for your shell to enable those.
+Shell integration is **optional**. Without it, `session_log`, `ai_query`, and `error_help` all work — you just won't get per-command boundaries, accurate exit codes, or CWD tracking. Source the integration script for your shell to enable those.
 
 All scripts guard themselves with the `TTYRELL` environment variable and are inert when sourced outside the proxy.
+
+The installer can add shell integration automatically. To add it manually:
 
 ### bash
 
@@ -230,11 +252,13 @@ Plugins are loaded from `lua/plugins/` at startup. Each is optional — if the f
 
 ### session_log
 
-Writes a full session transcript to `~/.local/share/ttyrell/sessions/YYYY-MM-DD_HH-MM-SS.jsonl`. Captures every input line and every output chunk with timestamps. SSH sessions are captured automatically.
+Writes a full session transcript to the [session log directory](#session-log-locations). Captures every input line and every output chunk with timestamps. SSH sessions are captured automatically.
+
+TUI applications (vim, htop, claude, etc.) are detected via the alternate screen buffer escape sequence and their output is not logged — only the command that launched the TUI and its exit code are recorded.
 
 ### ai_query
 
-Type `#ai: <question>` at any prompt. The line is intercepted, sent to the LLM, and the response is printed inline. The line is never forwarded to the shell.
+Type `#ai: <question>` at any prompt. The line is intercepted, sent to the LLM with recent session context, and the response is printed inline. The line is never forwarded to the shell.
 
 ```
 $ #ai: why is my Dockerfile build slow
@@ -244,34 +268,61 @@ $ #ai: why is my Dockerfile build slow
 
 If the LLM suggests a shell command it appends `EXEC: <cmd>` — ttyrell shows it and asks `[y/N]` before running anything.
 
-Configure the provider in the plugin file:
+#### File references
+
+Include file content in context by prefixing a path with `@`:
+
+```
+$ #ai: @src/main.rs why is line 42 failing
+$ #ai: @Cargo.toml @src/lib.rs explain the dependency setup
+$ #ai: @logs/error.log what went wrong here
+```
+
+Paths are resolved relative to your shell's current working directory (tracked automatically via shell integration). Absolute paths also work.
+
+#### Context settings
+
+Set these in `init.lua` before the plugin loads (or in the plugin file itself):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AI_CONTEXT_COMMANDS` | `10` | Recent command/output pairs from the session log sent as context. `0` = disabled (falls back to raw output buffer). Lower for small local models. |
+| `AI_CONTEXT_FILE_LINES` | `200` | Max lines read per `@file` reference. `0` = no limit. |
+| `AI_CONTEXT_LINES` | `64` | Size of the raw output buffer used when `AI_CONTEXT_COMMANDS = 0` or no session log is available. |
+
+```lua
+-- init.lua — tune for a small local model
+AI_CONTEXT_COMMANDS  = 5
+AI_CONTEXT_FILE_LINES = 100
+```
+
+#### LLM provider
+
 ```lua
 AI_QUERY_LLM = LLM.local_llama
 ```
 
 ### error_help
 
-On any non-zero exit code, sends the last 64 lines of terminal output to the LLM as context and prints a specific suggestion inline. Ignores commands where non-zero is routine: `grep`, `diff`, `test`, `false`, `[`, `:`.
+On any non-zero exit code, sends recent terminal output to the LLM as context and prints a specific suggestion inline. Ignores commands where non-zero is routine: `grep`, `diff`, `test`, `false`, `[`, `:`.
 
-Configure the provider in the plugin file:
 ```lua
 ERROR_HELP_LLM = LLM.local_llama
 ```
 
 ### workflow_journal
 
-At session end, spawns a background process that reads the session log, asks the LLM to group commands into named tasks, and appends the result to a running journal file at `~/.local/share/ttyrell/journal.md`.
+At session end, spawns a background process that reads the session log, asks the LLM to group commands into named tasks, and appends the result to a running journal file.
 
 Optional Obsidian integration writes each entry to a daily note in your vault.
 
-Configure in the plugin file:
 ```lua
 JOURNAL_LLM            = LLM.claude
 JOURNAL_OBSIDIAN_VAULT = "/path/to/your/vault"
 JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
 ```
 
-The prompt that guides the journal entries is also editable in the plugin file via `JOURNAL_PROMPT` — no Rust rebuild required.
+The prompt that guides the journal entries is editable via `JOURNAL_PROMPT` in the plugin file — no Rust rebuild required.
 
 ---
 
@@ -313,12 +364,17 @@ end
 | `command_start` | — | Requires shell integration |
 | `command_exit` | `exit_code` | Requires shell integration |
 | `prompt_start` | — | Requires shell integration |
+| `tui_start` | — | TUI app entered alternate screen (`ESC[?1049h`) |
+| `tui_end` | — | TUI app left alternate screen (`ESC[?1049l`) |
+| `cwd_changed` | `path` | Shell reported new CWD via OSC 7 (requires shell integration) |
 
 ### proxy global
 
 ```lua
 proxy.on(event, fn)                       -- register event handler
 proxy.inject_output(text)                 -- write text to terminal
+proxy.spawn(cmd)                          -- run a shell command in the background
+proxy.send_input(text)                    -- write text to the PTY as if typed
 proxy.http_post(url, body [, headers])    -- returns status_code, body_string
 proxy.json_encode(value)                  -- Lua value → JSON string
 proxy.json_decode(string)                 -- JSON string → Lua value
@@ -335,7 +391,7 @@ local llm = require("llm")
 
 -- prompt  : the instruction or question
 -- cfg     : a provider table from the LLM palette (e.g. LLM.local_llama)
--- context : optional data blob appended after the prompt (log output, terminal history, etc.)
+-- context : optional data blob appended after the prompt (log output, file content, etc.)
 local response, err = llm.query(prompt, cfg, context)
 ```
 
@@ -368,14 +424,12 @@ ttyrell loads `lua/init.lua` from the first path that exists:
 | Fallback | `~/.ttyrell/lua/init.lua` | |
 | Dev fallback | `./lua/init.lua` (current directory) | |
 
-The first path that exists on disk is used.
-
 ### Session log locations
 
 | Platform | Path |
 |----------|------|
 | macOS / Linux | `~/.local/share/ttyrell/sessions/` |
-| Windows | `%USERPROFILE%\.local\share\ttyrell\sessions\` |
+| Windows | `%LOCALAPPDATA%\ttyrell\sessions\` |
 
 ### Log format
 
@@ -383,11 +437,12 @@ Each session file is JSONL. One JSON object per line:
 
 ```json
 {"type":"session_start","host":"mybox","shell":"/bin/zsh","t":"2025-01-15T14:23:01Z"}
-{"type":"input","data":"ssh dev@server\n","t":"2025-01-15T14:23:05Z"}
-{"type":"output","data":"dev@server:~$ ","t":"2025-01-15T14:23:06Z"}
-{"type":"command_exit","exit_code":0,"t":"2025-01-15T14:23:10Z"}
+{"type":"input","data":"ssh dev@server","t":"2025-01-15T14:23:05Z"}
+{"type":"output","data":"Welcome to Ubuntu 22.04","exit_code":0,"t":"2025-01-15T14:23:06Z"}
 {"type":"session_end","t":"2025-01-15T14:45:22Z"}
 ```
+
+TUI commands (vim, htop, etc.) produce an `output` entry with no `data` field — the screen content is intentionally not logged.
 
 ---
 
@@ -397,8 +452,9 @@ Each session file is JSONL. One JSON object per line:
 
 - Use `\r\n` in `proxy.inject_output` for correct line breaks in the terminal.
 - Home directory is `os.getenv("USERPROFILE")` — `os.getenv("HOME")` may be unset.
+- Data files (session logs, journal) are written to `%LOCALAPPDATA%\ttyrell\`.
 - Path separator is `\` but Lua's `io` functions accept `/` on Windows.
-- `os.execute("mkdir -p path")` does not work; use `os.execute("mkdir path 2>nul")` or check existence first.
+- `os.execute("mkdir -p path")` does not work; use `os.execute("mkdir path 2>nul")`.
 - `command_start` events are not available in PowerShell (no PS0 equivalent).
 - `cmd.exe` has no shell integration support.
 
@@ -406,10 +462,11 @@ Each session file is JSONL. One JSON object per line:
 
 - Home directory is `os.getenv("HOME")`.
 - `\r\n` and `\n` both work in `proxy.inject_output` but `\r\n` is safer in raw PTY mode.
+- On Linux, `fish` conf.d path respects `$XDG_CONFIG_HOME` if set.
 
 ### SSH sessions
 
-Shell integration on remote machines is optional. Without it, all input and output is still captured via the `input` and `output` events — just without per-command boundaries. The remote hostname appears naturally in prompt output (e.g. `user@remote:~$`), making sessions self-documenting in the log.
+Shell integration on remote machines is optional. Without it, all input and output is still captured via the `input` and `output` events — just without per-command boundaries or CWD tracking. The remote hostname appears naturally in prompt output (e.g. `user@remote:~$`), making sessions self-documenting in the log.
 
 ---
 
@@ -427,11 +484,17 @@ Check that the file exists at one of the config paths above. The proxy prints `F
 **ai_query / error_help / workflow_journal does nothing**
 Each plugin needs an LLM provider assigned. Check that the `LLM` palette in `init.lua` has an entry for the provider the plugin references, and that the plugin file sets its `*_LLM` variable. Test with `#ai: hello`.
 
+**`#ai: @file` says "cannot open"**
+Paths resolve relative to the shell's CWD, which requires shell integration to be loaded. Without it, paths resolve relative to where ttyrell was launched. Use an absolute path to confirm the file is readable.
+
 **Session log is not being created**
-Check that `$HOME` (macOS/Linux) or `%USERPROFILE%` (Windows) is set. Check stderr for `[session_log] cannot open log:` messages.
+Check that `$HOME` (macOS/Linux) or `%LOCALAPPDATA%` (Windows) is set. Check stderr for `[session_log] cannot open log:` messages.
 
 **Shell integration not firing command_exit**
 Verify `TTYRELL=1` is exported before sourcing the integration script. Check that the script is being sourced, not executed (`source integration.bash`, not `./integration.bash`).
 
 **Journal not writing after session ends**
 Check stderr for `[journal] JOURNAL_PROMPT not set` — this means `workflow_journal.lua` was not loaded. Verify it appears in the plugin list in `init.lua`.
+
+**TUI apps (vim, claude, etc.) leave garbage in the session log**
+This should not happen — ttyrell detects alternate screen entry (`ESC[?1049h`) and suppresses output buffering automatically. If you see garbage, the TUI may not be using the alternate screen buffer.
