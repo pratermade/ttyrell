@@ -3,17 +3,30 @@
 -- Logs every command_start/command_exit pair as a JSONL entry.
 -- Writes to ~/.local/share/ttyrell/activity.jsonl
 
-local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
-if home == "" then
-    print("[activity_log] HOME not set; logging disabled")
-    return
+local log_dir
+if package.config:sub(1, 1) == '\\' then
+    local appdata = (os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or ""):gsub('\\', '/')
+    if appdata == "" then
+        print("[activity_log] LOCALAPPDATA not set; logging disabled")
+        return
+    end
+    log_dir = appdata .. "/ttyrell"
+else
+    local home = os.getenv("HOME") or ""
+    if home == "" then
+        print("[activity_log] HOME not set; logging disabled")
+        return
+    end
+    log_dir = home .. "/.local/share/ttyrell"
 end
-
-local log_dir = home .. "/.local/share/ttyrell"
 local log_file = log_dir .. "/activity.jsonl"
 
--- Ensure directory exists
-os.execute("mkdir -p " .. log_dir)
+-- Ensure directory exists (cross-platform)
+if package.config:sub(1, 1) == '\\' then
+    os.execute('mkdir "' .. log_dir:gsub('/', '\\') .. '" 2>nul')
+else
+    os.execute('mkdir -p "' .. log_dir .. '"')
+end
 
 local f, err = io.open(log_file, "a")
 if not f then

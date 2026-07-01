@@ -150,9 +150,13 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Ve
 
     // proxy.spawn(cmd) — run a shell command in the background (non-blocking)
     let spawn_fn = lua.create_function(|_lua, cmd: String| {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+        #[cfg(windows)]
+        let (interpreter, flag) = ("cmd", "/C");
+        #[cfg(not(windows))]
+        let (interpreter, flag) = ("sh", "-c");
+
+        std::process::Command::new(interpreter)
+            .args([flag, &cmd])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

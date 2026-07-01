@@ -1,9 +1,17 @@
+mod install;
 mod lua_api;
 mod osc;
 mod proxy;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // --install forces the setup wizard regardless of existing installation.
+    // Otherwise, run the wizard automatically on first launch (no config + tty).
+    let force_install = args.iter().any(|a| a == "--install");
+    if force_install || (!install::is_installed() && install::stdin_is_tty()) {
+        return install::run(force_install);
+    }
 
     // --summarize <log_path> <out_path>
     let summarize_args = args.iter().position(|a| a == "--summarize").map(|pos| {
@@ -27,7 +35,8 @@ fn main() -> anyhow::Result<()> {
 
     // Expose the binary path so Lua can re-invoke it for background tasks
     let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("ttyrell"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(std::env::consts::EXE_SUFFIX)
+            .with_file_name(format!("ttyrell{}", std::env::consts::EXE_SUFFIX)))
         .to_string_lossy()
         .to_string();
     lua.globals().set("TTYRELL_BIN", exe_path)
@@ -86,6 +95,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Run the PTY proxy
+    #[cfg(windows)]
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    #[cfg(not(windows))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     proxy::run(&shell, registry, &lua, send_input_rx)?;
 
@@ -115,7 +127,7 @@ fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_sec
     lua.globals().set("__journal_duration__", duration_str)
         .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
 
-    lua.load(r"
+    lua.load(r#"
         local ok, llm = pcall(require, 'llm')
         if not (ok and llm) then return end
 
@@ -140,7 +152,11 @@ fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_sec
         if JOURNAL_OBSIDIAN_VAULT then
             local sub_dir = JOURNAL_OBSIDIAN_DIR or 'Work Journal'
             local vault_dir = JOURNAL_OBSIDIAN_VAULT .. '/' .. sub_dir
-            os.execute('mkdir -p ' .. vault_dir:gsub(' ', '\\ '))
+            if package.config:sub(1, 1) == '\\' then
+                os.execute('mkdir "' .. vault_dir:gsub('/', '\\') .. '" 2>nul')
+            else
+                os.execute('mkdir -p "' .. vault_dir .. '"')
+            end
 
             local daily_file = vault_dir .. '/' .. os.date('%Y-%m-%d') .. '.md'
             local obs_entry  = '## ' .. os.date('%H:%M') .. ' -- ' .. __journal_duration__ .. '\n\n'
@@ -148,7 +164,7 @@ fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_sec
             local of = io.open(daily_file, 'a')
             if of then of:write(obs_entry); of:close() end
         end
-    ").exec().map_err(|e| anyhow::anyhow!("journal lua: {}", e))?;
+    "#).exec().map_err(|e| anyhow::anyhow!("journal lua: {}", e))?;
 
     Ok(())
 }

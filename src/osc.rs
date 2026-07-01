@@ -9,6 +9,10 @@ pub enum OscEvent {
     CommandExit(String),
     /// Shell integration: prompt rendered
     PromptStart,
+    /// TUI app entered alternate screen buffer (ESC[?1049h)
+    TuiStart,
+    /// TUI app left alternate screen buffer (ESC[?1049l)
+    TuiEnd,
 }
 
 /// A streaming parser for OSC 133 escape sequences.
@@ -25,6 +29,7 @@ pub enum OscEvent {
 pub struct OscParser {
     state: ParserState,
     pending_osc: BytesMut,
+    pending_csi: BytesMut,
 }
 
 enum ParserState {
@@ -32,6 +37,7 @@ enum ParserState {
     FoundEsc,
     InOSC,
     InOscFoundEsc, // saw ESC inside OSC — waiting to confirm ST terminator
+    InCSI,         // saw ESC [ — accumulating CSI params until final byte
 }
 
 impl OscParser {
@@ -39,6 +45,7 @@ impl OscParser {
         Self {
             state: ParserState::Normal,
             pending_osc: BytesMut::new(),
+            pending_csi: BytesMut::new(),
         }
     }
 
@@ -63,10 +70,35 @@ impl OscParser {
                         // ESC ] — start of OSC sequence
                         self.state = ParserState::InOSC;
                         self.pending_osc.clear();
+                    } else if byte == 0x5b {
+                        // ESC [ — start of CSI sequence
+                        self.state = ParserState::InCSI;
+                        self.pending_csi.clear();
                     } else {
-                        // Not an OSC — emit ESC and the byte as-is
+                        // Not an OSC or CSI — emit ESC and the byte as-is
                         output.extend_from_slice(&[0x1b, byte]);
                         self.state = ParserState::Normal;
+                    }
+                }
+                ParserState::InCSI => {
+                    if byte >= 0x40 {
+                        // Final byte (0x40–0x7E) — sequence complete
+                        let params = std::str::from_utf8(&self.pending_csi).unwrap_or("");
+                        if params == "?1049" {
+                            if byte == b'h' {
+                                events.push(OscEvent::TuiStart);
+                            } else if byte == b'l' {
+                                events.push(OscEvent::TuiEnd);
+                            }
+                        }
+                        // Pass the full CSI sequence to clean output; strip_ansi removes it
+                        output.extend_from_slice(b"\x1b[");
+                        output.extend_from_slice(&self.pending_csi);
+                        output.extend_from_slice(&[byte]);
+                        self.pending_csi.clear();
+                        self.state = ParserState::Normal;
+                    } else {
+                        self.pending_csi.extend_from_slice(&[byte]);
                     }
                 }
                 ParserState::InOSC => {
@@ -200,6 +232,66 @@ mod tests {
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], OscEvent::CommandStart));
         assert_eq!(&out2[..], b"after");
+    }
+
+    #[test]
+    fn test_tui_start_emits_event() {
+        let mut parser = OscParser::new();
+        let (events, out, _) = parser.feed(b"\x1b[?1049hsome text");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OscEvent::TuiStart));
+        // CSI sequence passed through to clean output (strip_ansi will drop it)
+        assert!(out.windows(b"\x1b[".len()).any(|w| w == b"\x1b["));
+        assert!(out.ends_with(b"some text"));
+    }
+
+    #[test]
+    fn test_tui_end_emits_event() {
+        let mut parser = OscParser::new();
+        let (events, _, _) = parser.feed(b"\x1b[?1049l");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OscEvent::TuiEnd));
+    }
+
+    #[test]
+    fn test_tui_start_and_end_in_same_feed() {
+        let mut parser = OscParser::new();
+        let (events, _, _) = parser.feed(b"\x1b[?1049htext\x1b[?1049l");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], OscEvent::TuiStart));
+        assert!(matches!(events[1], OscEvent::TuiEnd));
+    }
+
+    #[test]
+    fn test_other_csi_not_emitted_as_event() {
+        let mut parser = OscParser::new();
+        // ESC[2J (clear screen) and ESC[H (cursor home) — no TUI events
+        let (events, _, _) = parser.feed(b"\x1b[2J\x1b[H");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_csi_split_across_reads() {
+        let mut parser = OscParser::new();
+        // Split "\x1b[?1049h" across two reads
+        let (events1, _, _) = parser.feed(b"\x1b[?10");
+        assert!(events1.is_empty());
+        let (events2, _, _) = parser.feed(b"49h");
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(events2[0], OscEvent::TuiStart));
+    }
+
+    #[test]
+    fn test_osc133_and_tui_interleaved() {
+        let mut parser = OscParser::new();
+        let data = b"\x1b]133;C\x07\x1b[?1049hstuff\x1b[?1049l\x1b]133;D;0\x07";
+        let (events, _, _) = parser.feed(data);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], OscEvent::CommandStart));
+        assert!(matches!(events[1], OscEvent::TuiStart));
+        assert!(matches!(events[2], OscEvent::TuiEnd));
+        if let OscEvent::CommandExit(ref c) = events[3] { assert_eq!(c, "0"); }
+        else { panic!("expected CommandExit"); }
     }
 
     #[test]

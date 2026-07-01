@@ -11,15 +11,31 @@ if TTYRELL_MODE then return end  -- skip in all background modes (summarize, jou
 local _ok_sg, _sg = pcall(require, "secret_guard")
 local sanitize = (_ok_sg and _sg and _sg.sanitize) or function(t) return t end
 
-local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
-if home == "" then
-    print("[session_log] HOME not set; logging disabled")
-    return
+local base_dir
+if package.config:sub(1, 1) == '\\' then
+    local appdata = (os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or ""):gsub('\\', '/')
+    if appdata == "" then
+        print("[session_log] LOCALAPPDATA not set; logging disabled")
+        return
+    end
+    base_dir = appdata .. "/ttyrell"
+else
+    local home = os.getenv("HOME") or ""
+    if home == "" then
+        print("[session_log] HOME not set; logging disabled")
+        return
+    end
+    base_dir = home .. "/.local/share/ttyrell"
 end
-
-local base_dir = home .. "/.local/share/ttyrell"
-os.execute("mkdir -p " .. base_dir .. "/sessions")
-os.execute("mkdir -p " .. base_dir .. "/summaries")
+local function mkdir_p(path)
+    if package.config:sub(1, 1) == '\\' then
+        os.execute('mkdir "' .. path:gsub('/', '\\') .. '" 2>nul')
+    else
+        os.execute('mkdir -p "' .. path .. '"')
+    end
+end
+mkdir_p(base_dir .. "/sessions")
+mkdir_p(base_dir .. "/summaries")
 
 local stamp = os.date("%Y-%m-%d_%H-%M-%S")
 local session_path = base_dir .. "/sessions/" .. stamp .. ".jsonl"
@@ -63,6 +79,19 @@ end
 local input_buf = {}
 local output_buf = {}
 local tab_pending = false  -- set when Tab is pressed, cleared by next output chunk
+local tui_depth = 0        -- incremented on alternate-screen enter, decremented on exit
+
+proxy.on("tui_start", function()
+    tui_depth = tui_depth + 1
+    output_buf = {}  -- discard any pre-TUI fragments
+    input_buf  = {}
+end)
+
+proxy.on("tui_end", function()
+    tui_depth = math.max(0, tui_depth - 1)
+    output_buf = {}  -- discard TUI output garbage
+    input_buf  = {}
+end)
 
 local function flush_output()
     local response = clean_output(table.concat(output_buf))
@@ -86,6 +115,7 @@ local function get_cmd_from_output()
 end
 
 proxy.on("input", function(data)
+    if tui_depth > 0 then return end
     for i = 1, #data do
         local ch = data:sub(i, i)
         local b = ch:byte()
@@ -113,6 +143,7 @@ proxy.on("command_start", function()
 end)
 
 proxy.on("output", function(text)
+    if tui_depth > 0 then return end
     table.insert(output_buf, text)
 
     if tab_pending then
@@ -178,8 +209,8 @@ proxy.on("session_end", function()
     if not (ok and llm) then return end
 
     local summary_path = base_dir .. "/summaries/" .. stamp .. ".txt"
-    local bin = (TTYRELL_BIN or "ttyrell"):gsub("'", "")
-    proxy.spawn(string.format("'%s' --summarize '%s' '%s'",
+    local bin = (TTYRELL_BIN or "ttyrell"):gsub('"', '')
+    proxy.spawn(string.format('"%s" --summarize "%s" "%s"',
         bin, session_path, summary_path))
     proxy.inject_output(
         "\r\n[session_log] summarizing in background → summaries/" .. stamp .. ".txt\r\n"

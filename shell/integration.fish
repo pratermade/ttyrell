@@ -5,7 +5,7 @@
 
 # Guard: only activate inside ttyrell
 if not set -q TTYRELL
-    exit
+    return
 end
 
 function __ttyrell_preexec --on-event fish_preexec

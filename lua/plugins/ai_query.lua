@@ -18,6 +18,10 @@ local CONTEXT_LINES = (type(AI_CONTEXT_LINES) == "number" and AI_CONTEXT_LINES >
 -- Rolling buffer of recent output lines (ANSI-stripped by proxy.rs)
 local history = {}
 
+proxy.on("tui_start", function()
+    history = {}
+end)
+
 proxy.on("output", function(text)
     for line in (text .. "\n"):gmatch("([^\n]*)\n") do
         if #line > 0 then

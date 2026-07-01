@@ -27,6 +27,10 @@ end
 local recent_lines = {}
 local MAX_LINES = 64
 
+proxy.on("tui_start", function()
+    recent_lines = {}
+end)
+
 proxy.on("output", function(text)
     for line in (text .. "\n"):gmatch("([^\n]*)\n") do
         if #line > 0 then

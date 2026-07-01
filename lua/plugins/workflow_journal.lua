@@ -7,8 +7,8 @@
 -- ── Settings ─────────────────────────────────────────────────────────────────
 -- Uncomment and edit any of these to customize behaviour:
 --
-JOURNAL_OBSIDIAN_VAULT = "/Volumes/home/pratersm/obsidian/notes"
-JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
+-- JOURNAL_OBSIDIAN_VAULT = "/path/to/your/vault"
+-- JOURNAL_OBSIDIAN_DIR   = "Work Journal"   -- subdirectory inside the vault
 --
 -- Prompt sent to the LLM when writing journal entries.
 -- Edit this to change what the AI focuses on or how it formats output.
@@ -39,10 +39,18 @@ JOURNAL_LLM = LLM.local_llama
 
 if TTYRELL_MODE then return end  -- skip in background modes
 
-local home = os.getenv("HOME") or ""
-if home == "" then return end
+local data_dir
+if package.config:sub(1, 1) == '\\' then
+    local appdata = (os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or ""):gsub('\\', '/')
+    if appdata == "" then return end
+    data_dir = appdata .. "/ttyrell"
+else
+    local home = os.getenv("HOME") or ""
+    if home == "" then return end
+    data_dir = home .. "/.local/share/ttyrell"
+end
 
-local journal_path = home .. "/.local/share/ttyrell/journal.md"
+local journal_path = data_dir .. "/journal.md"
 
 local ok_llm, llm = pcall(require, "llm")
 if not (ok_llm and llm) then return end
@@ -65,8 +73,8 @@ proxy.on("session_end", function()
     if not content:find('"input"', 1, true) then return end
 
     local duration = math.max(1, os.time() - session_start)
-    local bin = (TTYRELL_BIN or "ttyrell"):gsub("'", "")
-    proxy.spawn(string.format("'%s' --journal '%s' '%s' %d",
+    local bin = (TTYRELL_BIN or "ttyrell"):gsub('"', '')
+    proxy.spawn(string.format('"%s" --journal "%s" "%s" %d',
         bin, log_path, journal_path, duration))
     proxy.inject_output("[journal] writing work log in background → journal.md\r\n")
 end)

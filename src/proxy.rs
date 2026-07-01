@@ -153,6 +153,12 @@ pub fn run(
                         OscEvent::PromptStart => {
                             let _ = registry.fire(lua, "prompt_start", vec![]);
                         }
+                        OscEvent::TuiStart => {
+                            let _ = registry.fire(lua, "tui_start", vec![]);
+                        }
+                        OscEvent::TuiEnd => {
+                            let _ = registry.fire(lua, "tui_end", vec![]);
+                        }
                     }
                 }
             }
