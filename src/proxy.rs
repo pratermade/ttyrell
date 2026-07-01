@@ -159,6 +159,9 @@ pub fn run(
                         OscEvent::TuiEnd => {
                             let _ = registry.fire(lua, "tui_end", vec![]);
                         }
+                        OscEvent::CwdChanged(dir) => {
+                            let _ = registry.fire(lua, "cwd_changed", vec![dir.clone()]);
+                        }
                     }
                 }
             }

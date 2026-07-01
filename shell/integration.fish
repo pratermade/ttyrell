@@ -15,4 +15,5 @@ end
 function __ttyrell_precmd --on-event fish_postexec
     printf '\033]133;D;%s\007' $status
     printf '\033]133;A\007'
+    printf '\033]7;file://localhost%s\007' $PWD
 end

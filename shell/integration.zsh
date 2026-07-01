@@ -16,6 +16,7 @@ __ttyrell_precmd() {
     local code=$?
     printf '\033]133;D;%s\007' "$code"
     printf '\033]133;A\007'
+    printf '\033]7;file://localhost%s\007' "$PWD"
 }
 
 # Add to precmd_functions without clobbering existing hooks

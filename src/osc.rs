@@ -13,6 +13,8 @@ pub enum OscEvent {
     TuiStart,
     /// TUI app left alternate screen buffer (ESC[?1049l)
     TuiEnd,
+    /// Shell reported its current working directory via OSC 7
+    CwdChanged(String),
 }
 
 /// A streaming parser for OSC 133 escape sequences.
@@ -136,12 +138,45 @@ impl OscParser {
         (events, output, BytesMut::new())
     }
 
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8 as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+impl OscParser {
     fn finish_osc(&mut self, events: &mut Vec<OscEvent>) {
         let payload = std::mem::take(&mut self.pending_osc);
         let text = std::str::from_utf8(&payload).unwrap_or("");
         let text = text.trim_end_matches(|c| c == '\0' || c == '\x1b');
 
-        if text == "133;C" || text == "133;C\0" {
+        if text.starts_with("7;file://") {
+            // OSC 7: shell CWD notification. Format: 7;file://hostname/path
+            // Skip "7;file://" then skip the hostname (everything before the first /).
+            let rest = &text[9..];
+            let path = rest.find('/').map(|i| &rest[i..]).unwrap_or(rest);
+            // URL-decode percent-encoded characters (e.g. %20 → space)
+            let decoded = percent_decode(path);
+            if !decoded.is_empty() {
+                events.push(OscEvent::CwdChanged(decoded));
+            }
+        } else if text == "133;C" || text == "133;C\0" {
             events.push(OscEvent::CommandStart);
         } else if text == "133;A" || text == "133;A\0" {
             events.push(OscEvent::PromptStart);
@@ -232,6 +267,54 @@ mod tests {
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], OscEvent::CommandStart));
         assert_eq!(&out2[..], b"after");
+    }
+
+    #[test]
+    fn test_osc7_cwd_basic() {
+        let mut parser = OscParser::new();
+        let (events, _, _) = parser.feed(b"\x1b]7;file://localhost/home/user/projects\x07");
+        assert_eq!(events.len(), 1);
+        if let OscEvent::CwdChanged(ref p) = events[0] {
+            assert_eq!(p, "/home/user/projects");
+        } else {
+            panic!("expected CwdChanged");
+        }
+    }
+
+    #[test]
+    fn test_osc7_cwd_percent_encoded() {
+        let mut parser = OscParser::new();
+        let (events, _, _) = parser.feed(b"\x1b]7;file://localhost/home/user/my%20project\x07");
+        assert_eq!(events.len(), 1);
+        if let OscEvent::CwdChanged(ref p) = events[0] {
+            assert_eq!(p, "/home/user/my project");
+        } else {
+            panic!("expected CwdChanged");
+        }
+    }
+
+    #[test]
+    fn test_osc7_cwd_no_hostname() {
+        // file:///path (empty hostname, triple slash)
+        let mut parser = OscParser::new();
+        let (events, _, _) = parser.feed(b"\x1b]7;file:///tmp/work\x07");
+        assert_eq!(events.len(), 1);
+        if let OscEvent::CwdChanged(ref p) = events[0] {
+            assert_eq!(p, "/tmp/work");
+        } else {
+            panic!("expected CwdChanged");
+        }
+    }
+
+    #[test]
+    fn test_osc7_interleaved_with_osc133() {
+        let mut parser = OscParser::new();
+        let data = b"\x1b]133;D;0\x07\x1b]7;file://localhost/home/user\x07\x1b]133;A\x07";
+        let (events, _, _) = parser.feed(data);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], OscEvent::CommandExit(_)));
+        assert!(matches!(events[1], OscEvent::CwdChanged(_)));
+        assert!(matches!(events[2], OscEvent::PromptStart));
     }
 
     #[test]

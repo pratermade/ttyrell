@@ -4,18 +4,26 @@
 -- history as context. If the AI wants to run a command it appends
 -- "EXEC: <cmd>" — ttyrell shows it and asks [y/N] before running anything.
 --
--- ── Context settings ─────────────────────────────────────────────────────────
--- AI_CONTEXT_COMMANDS: number of recent command/output pairs from the session
---   log to send as context. Set lower for small local models, higher for cloud.
---   0 = disabled (falls back to the raw output buffer below).
--- AI_CONTEXT_LINES: size of the raw output buffer used when AI_CONTEXT_COMMANDS
---   is 0 or the session log is unavailable. Default: 64.
+-- ── File references ───────────────────────────────────────────────────────────
+-- Include file content in context by mentioning @path in the question:
+--   #ai: @src/main.rs why is line 42 failing
+--   #ai: @Cargo.toml @src/lib.rs explain the dependency setup
+-- The @ is stripped from the question text; the file content appears in context.
+-- Paths are resolved relative to the directory ttyrell was launched from.
 --
--- AI_CONTEXT_COMMANDS = 10
--- AI_CONTEXT_LINES    = 64
+-- ── Context settings ─────────────────────────────────────────────────────────
+-- AI_CONTEXT_COMMANDS: recent command/output pairs from the session log.
+--   0 = disabled (falls back to raw output buffer). Default: 10.
+-- AI_CONTEXT_FILE_LINES: max lines read per @file reference. 0 = unlimited.
+--   Default: 200. Set lower for small local models.
+-- AI_CONTEXT_LINES: raw output buffer depth used when AI_CONTEXT_COMMANDS = 0.
+--   Default: 64.
+--
+-- AI_CONTEXT_COMMANDS  = 10
+-- AI_CONTEXT_FILE_LINES = 200
+-- AI_CONTEXT_LINES      = 64
 --
 -- ── LLM provider ─────────────────────────────────────────────────────────────
--- LLM provider for AI queries — pick from the palette defined in init.lua:
 AI_QUERY_LLM = LLM.local_llama
 -- AI_QUERY_LLM = LLM.claude
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -25,8 +33,15 @@ local llm = require("llm")
 local CONTEXT_LINES = (type(AI_CONTEXT_LINES) == "number" and AI_CONTEXT_LINES > 0)
     and AI_CONTEXT_LINES or 64
 
--- Rolling buffer of recent output lines — used when AI_CONTEXT_COMMANDS is 0
--- or the session log is unavailable.
+-- Tracks the shell's working directory, updated via OSC 7 from shell integration.
+-- Falls back to the directory ttyrell was launched from.
+local current_dir = os.getenv("PWD") or "."
+
+proxy.on("cwd_changed", function(dir)
+    current_dir = dir
+end)
+
+-- Rolling buffer of recent output lines — fallback when AI_CONTEXT_COMMANDS = 0
 local history = {}
 
 proxy.on("tui_start", function()
@@ -46,9 +61,62 @@ proxy.on("output", function(text)
     end
 end)
 
+-- ── File reading ──────────────────────────────────────────────────────────────
+
+--- Extract @path tokens from a question string.
+-- Strips the @ sigil from each token in-place and returns the cleaned question
+-- alongside the list of paths.
+local function extract_file_refs(question)
+    local paths = {}
+    local cleaned = question:gsub("@([^%s]+)", function(path)
+        table.insert(paths, path)
+        return path  -- keep the path text, just drop the @
+    end):match("^%s*(.-)%s*$")
+    return cleaned, paths
+end
+
+--- Resolve a path relative to the shell's current directory.
+local function resolve_path(path)
+    if path:sub(1, 1) == "/" then return path end  -- already absolute
+    return current_dir .. "/" .. path
+end
+
+--- Read a file and return its content as a string, or nil + error message.
+local function read_file(path)
+    local f = io.open(path, "r")
+    if not f then return nil, "cannot open " .. path end
+
+    local max_lines = (type(AI_CONTEXT_FILE_LINES) == "number" and AI_CONTEXT_FILE_LINES >= 0)
+        and AI_CONTEXT_FILE_LINES or 200
+
+    local lines = {}
+    local truncated = false
+    for line in f:lines() do
+        -- Binary file check: NUL byte means not useful as text context
+        if line:find("\0") then
+            f:close()
+            return nil, path .. " appears to be a binary file"
+        end
+        if max_lines > 0 and #lines >= max_lines then
+            truncated = true
+            break
+        end
+        table.insert(lines, line)
+    end
+    f:close()
+
+    if #lines == 0 then return nil, path .. " is empty" end
+
+    local content = table.concat(lines, "\n")
+    if truncated then
+        content = content .. "\n\n... (truncated at " .. max_lines .. " lines — set AI_CONTEXT_FILE_LINES to read more)"
+    end
+    return content, nil
+end
+
+-- ── Session log context ───────────────────────────────────────────────────────
+
 --- Read the last n command/output pairs from the current session log.
--- Parses CURRENT_SESSION_LOG (JSONL written by session_log.lua) and returns
--- a formatted string suitable for LLM context, or nil if unavailable.
 local function read_session_context(n)
     if n <= 0 then return nil end
     local log_path = CURRENT_SESSION_LOG
@@ -59,7 +127,6 @@ local function read_session_context(n)
     local content = f:read("*a")
     f:close()
 
-    -- Walk the JSONL: group output entries under their preceding input entry.
     local pairs_list = {}
     local current = nil
 
@@ -85,7 +152,6 @@ local function read_session_context(n)
 
     if #pairs_list == 0 then return nil end
 
-    -- Take the last n pairs and format them.
     local start = math.max(1, #pairs_list - n + 1)
     local parts = {}
     for i = start, #pairs_list do
@@ -101,7 +167,8 @@ local function read_session_context(n)
     return "Recent commands:\n\n" .. table.concat(parts, "\n\n")
 end
 
--- Set while waiting for the user to answer a permission prompt
+-- ── Query handler ─────────────────────────────────────────────────────────────
+
 local pending_cmd = nil
 local buf = {}
 
@@ -113,7 +180,6 @@ local EXEC_INSTRUCTIONS =
     "The user will be shown the command and asked for permission before it runs.\n\n"
 
 proxy.on("input", function(data)
-    -- Intercept keypresses while waiting for permission
     if pending_cmd then
         for i = 1, #data do
             local ch = data:sub(i, i)
@@ -130,7 +196,6 @@ proxy.on("input", function(data)
         return "suppress"
     end
 
-    -- Normal #ai: line buffering
     for i = 1, #data do
         local ch = data:sub(i, i)
         local b  = ch:byte()
@@ -138,18 +203,39 @@ proxy.on("input", function(data)
             local line = table.concat(buf)
             buf = {}
             if line:match("^#ai:") then
-                local question = line:gsub("^#ai:%s*", ""):gsub("%s+$", "")
-                if #question > 0 then
+                local raw = line:gsub("^#ai:%s*", ""):gsub("%s+$", "")
+                if #raw > 0 then
                     proxy.inject_output("\r\n[ai] thinking...\r\n")
 
-                    -- Prefer structured session-log context; fall back to text buffer.
+                    local question, file_refs = extract_file_refs(raw)
+
+                    -- 1. File context (listed files, in order)
+                    local context_parts = {}
+                    for _, path in ipairs(file_refs) do
+                        local content, err = read_file(resolve_path(path))
+                        if err then
+                            proxy.inject_output("[ai] " .. err .. "\r\n")
+                        else
+                            table.insert(context_parts,
+                                "File: " .. path .. "\n```\n" .. content .. "\n```")
+                        end
+                    end
+
+                    -- 2. Session log context (structured command history)
                     local n_cmds = (type(AI_CONTEXT_COMMANDS) == "number")
                         and AI_CONTEXT_COMMANDS or 10
-                    local context = read_session_context(n_cmds)
-                    if not context and #history > 0 then
-                        context = "Recent terminal output:\n```\n" ..
-                            table.concat(history, "\n") .. "\n```"
+                    local session_ctx = read_session_context(n_cmds)
+                    if session_ctx then
+                        table.insert(context_parts, session_ctx)
+                    elseif #history > 0 then
+                        -- Fallback: raw output buffer
+                        table.insert(context_parts,
+                            "Recent terminal output:\n```\n" ..
+                            table.concat(history, "\n") .. "\n```")
                     end
+
+                    local context = #context_parts > 0
+                        and table.concat(context_parts, "\n\n") or nil
 
                     local prompt = EXEC_INSTRUCTIONS
                     if context then
