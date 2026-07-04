@@ -157,20 +157,42 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Ve
     })?;
     proxy_table.set("send_input", send_input_fn)?;
 
-    // proxy.spawn(cmd) — run a shell command in the background (non-blocking)
+    // proxy.spawn(cmd) — run a shell command in the background, fully detached.
+    // The child must outlive ttyrell and NOT hold the console open: the session
+    // summary and workflow journal re-invoke ttyrell to make (slow) LLM calls at
+    // session end, and without detachment the parent terminal blocks until those
+    // finish — so `exit` appears to hang and the journal can be torn down with
+    // the console before it completes.
     let spawn_fn = lua.create_function(|_lua, cmd: String| {
         #[cfg(windows)]
         let (interpreter, flag) = ("cmd", "/C");
         #[cfg(not(windows))]
         let (interpreter, flag) = ("sh", "-c");
 
-        std::process::Command::new(interpreter)
+        let mut command = std::process::Command::new(interpreter);
+        command
             .args([flag, &cmd])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(mlua::Error::external)?;
+            .stderr(std::process::Stdio::null());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS: run without a console, so the terminal does not
+            //   wait on the child after ttyrell exits.
+            // CREATE_NEW_PROCESS_GROUP: not signalled by Ctrl-C to our group.
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0); // leave the terminal's process group
+        }
+
+        command.spawn().map_err(mlua::Error::external)?;
         Ok(())
     })?;
     proxy_table.set("spawn", spawn_fn)?;

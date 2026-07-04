@@ -555,21 +555,29 @@ fn patch_llm_ref(content: &str, var_name: &str, new_ref: &str) -> String {
 /// or ensure both are commented out when it is not.
 fn patch_obsidian(content: &str, vault: Option<&str>) -> String {
     match vault {
-        Some(path) if !path.is_empty() => content
-            .lines()
-            .map(|l| {
-                let stripped = l.trim_start_matches("-- ");
-                if stripped.starts_with("JOURNAL_OBSIDIAN_VAULT =") {
-                    format!("JOURNAL_OBSIDIAN_VAULT = \"{path}\"")
-                } else if stripped.starts_with("JOURNAL_OBSIDIAN_DIR") {
-                    stripped.to_string()
-                } else {
-                    l.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
+        Some(path) if !path.is_empty() => {
+            // Embed with forward slashes: a Windows path's backslashes would form
+            // invalid Lua string escapes ("C:\Users" -> \U) and break the whole
+            // plugin file, so it silently fails to load. Lua's io/os accept
+            // forward slashes on Windows, and the journal converts them back to
+            // backslashes for mkdir.
+            let lua_path = path.replace('\\', "/");
+            content
+                .lines()
+                .map(|l| {
+                    let stripped = l.trim_start_matches("-- ");
+                    if stripped.starts_with("JOURNAL_OBSIDIAN_VAULT =") {
+                        format!("JOURNAL_OBSIDIAN_VAULT = \"{lua_path}\"")
+                    } else if stripped.starts_with("JOURNAL_OBSIDIAN_DIR") {
+                        stripped.to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
         _ => content
             .lines()
             .map(|l| {
@@ -1097,6 +1105,15 @@ local x = 1\n";
         // DIR line should be uncommented (keeping its default value)
         assert!(out.contains("JOURNAL_OBSIDIAN_DIR"));
         assert!(!out.contains("-- JOURNAL_OBSIDIAN_DIR"));
+    }
+
+    #[test]
+    fn patch_obsidian_converts_backslashes_to_forward_slashes() {
+        // A Windows path must not land in the Lua string with raw backslashes:
+        // "C:\Users" would be invalid Lua escapes (\U) and break the file.
+        let out = patch_obsidian(JOURNAL_SNIPPET, Some("C:\\Users\\me\\vault"));
+        assert!(out.contains("JOURNAL_OBSIDIAN_VAULT = \"C:/Users/me/vault\""));
+        assert!(!out.contains('\\'));
     }
 
     #[test]
