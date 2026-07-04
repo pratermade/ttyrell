@@ -26,7 +26,7 @@ Plugins are Lua files in `lua/plugins/`. They are loaded once at startup and reg
 `lua/init.lua` is the entry point. It sets up `package.path`, configures the LLM provider, then calls `try_load()` for each plugin:
 
 ```lua
-for _, name in ipairs({ "session_log", "ai_query", "error_help" }) do
+for _, name in ipairs({ "session_log", "ai_query", "workflow_journal" }) do
     try_load(plugins .. "/" .. name)
 end
 ```

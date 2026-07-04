@@ -607,10 +607,6 @@ fn patch_file(
             Some(r) => patch_llm_ref(content, "AI_QUERY_LLM", r),
             None => content.to_string(),
         },
-        "error_help.lua" => match llm_ref {
-            Some(r) => patch_llm_ref(content, "ERROR_HELP_LLM", r),
-            None => content.to_string(),
-        },
         "workflow_journal.lua" => {
             let s = match llm_ref {
                 Some(r) => patch_llm_ref(content, "JOURNAL_LLM", r),
@@ -625,10 +621,7 @@ fn patch_file(
 /// Files whose LLM provider / Obsidian settings the user may have edited.
 /// In upgrade mode these are left alone if they already exist on disk.
 fn is_user_editable(file_name: &str) -> bool {
-    matches!(
-        file_name,
-        "ai_query.lua" | "error_help.lua" | "workflow_journal.lua"
-    )
+    matches!(file_name, "ai_query.lua" | "workflow_journal.lua")
 }
 
 // ── Directory write ───────────────────────────────────────────────────────────
@@ -1152,13 +1145,6 @@ local x = 1\n";
     }
 
     #[test]
-    fn patch_file_routes_error_help() {
-        let input = "ERROR_HELP_LLM = LLM.local_llama\n";
-        let out = patch_file("error_help.lua", input, Some("LLM.openai"), None);
-        assert!(out.contains("ERROR_HELP_LLM = LLM.openai"));
-    }
-
-    #[test]
     fn patch_file_routes_workflow_journal_llm_and_obsidian() {
         let input = "JOURNAL_LLM = LLM.local_llama\n-- JOURNAL_OBSIDIAN_VAULT = \"/x\"\n";
         let out = patch_file(
@@ -1190,7 +1176,6 @@ local x = 1\n";
     #[test]
     fn is_user_editable_true_for_plugin_files() {
         assert!(is_user_editable("ai_query.lua"));
-        assert!(is_user_editable("error_help.lua"));
         assert!(is_user_editable("workflow_journal.lua"));
     }
 
@@ -1200,6 +1185,7 @@ local x = 1\n";
         assert!(!is_user_editable("secret_guard.lua"));
         assert!(!is_user_editable("session_log.lua"));
         assert!(!is_user_editable("activity_log.lua"));
+        assert!(!is_user_editable("error_help.lua"));
         assert!(!is_user_editable("init.lua"));
     }
 

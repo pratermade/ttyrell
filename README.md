@@ -142,7 +142,7 @@ ttyrell reads `$SHELL` to find your real shell, so zsh (or whichever shell you u
 
 ## Shell integration
 
-Shell integration is **optional**. Without it, `session_log`, `ai_query`, and `error_help` all work — you just won't get per-command boundaries, accurate exit codes, or CWD tracking. Source the integration script for your shell to enable those.
+Shell integration is **optional**. Without it, `session_log` and `ai_query` still work — you just won't get per-command boundaries, accurate exit codes, or CWD tracking. Source the integration script for your shell to enable those.
 
 All scripts guard themselves with the `TTYRELL` environment variable and are inert when sourced outside the proxy.
 
@@ -308,14 +308,6 @@ AI_CONTEXT_FILE_LINES = 100
 AI_QUERY_LLM = LLM.local_llama
 ```
 
-### error_help
-
-On any non-zero exit code, sends recent terminal output to the LLM as context and prints a specific suggestion inline. Ignores commands where non-zero is routine: `grep`, `diff`, `test`, `false`, `[`, `:`.
-
-```lua
-ERROR_HELP_LLM = LLM.local_llama
-```
-
 ### workflow_journal
 
 At session end, spawns a background process that reads the session log, asks the LLM to group commands into named tasks, and appends the result to a running journal file.
@@ -350,7 +342,7 @@ end)
 
 Add `"my_plugin"` to the plugin list in `lua/init.lua`:
 ```lua
-for _, name in ipairs({ "session_log", "ai_query", "error_help", "workflow_journal", "my_plugin" }) do
+for _, name in ipairs({ "session_log", "ai_query", "workflow_journal", "my_plugin" }) do
     try_load(plugins .. "/" .. name)
 end
 ```
@@ -487,7 +479,7 @@ This is expected. Each handler error is caught and printed; it does not crash th
 **init.lua is not loading**
 Check that the file exists at one of the config paths above. The proxy prints `Failed to load init.lua: ...` to stderr on error.
 
-**ai_query / error_help / workflow_journal does nothing**
+**ai_query / workflow_journal does nothing**
 Each plugin needs an LLM provider assigned. Check that the `LLM` palette in `init.lua` has an entry for the provider the plugin references, and that the plugin file sets its `*_LLM` variable. Test by pressing Ctrl-G and asking `hello`.
 
 **`@file` says "cannot open"**

@@ -56,6 +56,6 @@ end)
 local plugins = base .. "/plugins"
 -- activity_log is superseded by session_log; add it back here if you want the
 -- lightweight per-command JSONL log alongside the full session transcript.
-for _, name in ipairs({ "session_log", "ai_query", "error_help", "workflow_journal" }) do
+for _, name in ipairs({ "session_log", "ai_query", "workflow_journal" }) do
     try_load(plugins .. "/" .. name)
 end

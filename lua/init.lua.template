@@ -26,6 +26,6 @@ end)
 
 -- Built-in plugins (only loaded if the file exists)
 local plugins = base .. "/plugins"
-for _, name in ipairs({ "session_log", "ai_query", "error_help", "workflow_journal" }) do
+for _, name in ipairs({ "session_log", "ai_query", "workflow_journal" }) do
     try_load(plugins .. "/" .. name)
 end
