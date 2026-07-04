@@ -116,6 +116,7 @@ end
 
 proxy.on("input", function(data)
     if tui_depth > 0 then return end
+    if AI_QUERY_CAPTURING then return end  -- keystrokes belong to the AI prompt, not the shell
     for i = 1, #data do
         local ch = data:sub(i, i)
         local b = ch:byte()

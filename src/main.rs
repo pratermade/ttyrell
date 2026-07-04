@@ -4,6 +4,11 @@ mod osc;
 mod proxy;
 
 fn main() -> anyhow::Result<()> {
+    // rustls 0.23 (via ureq) requires a process-wide crypto provider before any
+    // TLS handshake, otherwise the first HTTPS request panics. ureq does not
+    // install one, so do it here. Idempotent-ish: ignore the "already set" error.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args: Vec<String> = std::env::args().collect();
 
     // --install forces the setup wizard regardless of existing installation.
@@ -96,12 +101,110 @@ fn main() -> anyhow::Result<()> {
 
     // Run the PTY proxy
     #[cfg(windows)]
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let shell = choose_windows_shell();
     #[cfg(not(windows))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     proxy::run(&shell, registry, &lua, send_input_rx)?;
 
     Ok(())
+}
+
+/// Pick the shell to spawn on Windows.
+///
+/// 1. `TTYRELL_SHELL` env var, if set (useful when a terminal profile launches
+///    ttyrell directly and there is no invoking shell to detect).
+/// 2. The invoking shell, detected by walking the parent-process chain — so
+///    running ttyrell from PowerShell drops you back into PowerShell.
+/// 3. `%COMSPEC%` (cmd.exe) as the fallback.
+#[cfg(windows)]
+fn choose_windows_shell() -> String {
+    if let Ok(s) = std::env::var("TTYRELL_SHELL") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Some(s) = detect_parent_shell() {
+        return s;
+    }
+    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+}
+
+/// Walk up the parent-process chain looking for a known interactive shell.
+/// Returns the shell's executable name (resolved on PATH when spawned), or None.
+#[cfg(windows)]
+fn detect_parent_shell() -> Option<String> {
+    use std::collections::HashMap;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut core::ffi::c_void;
+        fn Process32FirstW(snap: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snap: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap as isize == -1 {
+            return None;
+        }
+
+        let mut parent_of: HashMap<u32, u32> = HashMap::new();
+        let mut name_of: HashMap<u32, String> = HashMap::new();
+
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]);
+                parent_of.insert(entry.th32_process_id, entry.th32_parent_process_id);
+                name_of.insert(entry.th32_process_id, name);
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+
+        // Bounded walk up the ancestry. Stop at the first recognizable shell.
+        let mut pid = GetCurrentProcessId();
+        for _ in 0..16 {
+            let parent = *parent_of.get(&pid)?;
+            if parent == 0 {
+                return None;
+            }
+            let name = name_of.get(&parent)?.to_ascii_lowercase();
+            match name.strip_suffix(".exe").unwrap_or(&name) {
+                "pwsh" | "powershell" => return Some(name),
+                "cmd" => return None, // launched from cmd → let COMSPEC handle it
+                _ => {}
+            }
+            pid = parent;
+        }
+        None
+    }
 }
 
 fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_secs: u64) -> anyhow::Result<()> {

@@ -258,24 +258,30 @@ TUI applications (vim, htop, claude, etc.) are detected via the alternate screen
 
 ### ai_query
 
-Type `#ai: <question>` at any prompt. The line is intercepted, sent to the LLM with recent session context, and the response is printed inline. The line is never forwarded to the shell.
+Press the hotkey (**Ctrl-G** by default) at any prompt to open an `[ai]> ` line. Type a question and press Enter; the query is sent to the LLM with recent session context and the response is printed inline. Press Esc or Ctrl-C to cancel.
 
 ```
-$ #ai: why is my Dockerfile build slow
+[ai]> why is my Dockerfile build slow
 [ai] thinking...
 [ai] The most common cause is a large build context...
 ```
 
-If the LLM suggests a shell command it appends `EXEC: <cmd>` — ttyrell shows it and asks `[y/N]` before running anything.
+The keystrokes are intercepted and never reach the shell, so this works identically on cmd.exe, PowerShell, and POSIX shells. (Earlier versions used a `#ai:` text prefix, which relied on the line being a shell comment — that broke on cmd.exe, where `#` is not a comment.)
+
+The model is told which shell and OS you are running, so suggested commands use the right syntax (PowerShell vs. bash, etc.). If the LLM can provide a complete runnable command it appends `EXEC: <cmd>` — ttyrell shows it and asks `[y/N]` before running anything.
+
+On Windows, ConPTY tracks the shell's screen with absolute coordinates, so anything ttyrell draws directly onto the main screen desynchronizes the cursor and garbles later output. To avoid that, the question prompt opens in a temporary full-screen overlay (the alternate screen buffer, like `less`); when you press Enter it's torn down, restoring your screen exactly. The response is then displayed *by the shell itself*: the answer is written to `%LOCALAPPDATA%\ttyrell\ai_last.txt` and ttyrell types a `type <file>` command at your prompt, so it lands inline in your scrollback with a fresh prompt automatically. When the response includes a runnable command, press `y` or Enter at that prompt to run it; `n`/Esc declines, and any other key just types normally.
+
+Change the hotkey with `AI_QUERY_HOTKEY` (a byte value) in `init.lua`, e.g. `AI_QUERY_HOTKEY = 20` for Ctrl-T.
 
 #### File references
 
 Include file content in context by prefixing a path with `@`:
 
 ```
-$ #ai: @src/main.rs why is line 42 failing
-$ #ai: @Cargo.toml @src/lib.rs explain the dependency setup
-$ #ai: @logs/error.log what went wrong here
+[ai]> @src/main.rs why is line 42 failing
+[ai]> @Cargo.toml @src/lib.rs explain the dependency setup
+[ai]> @logs/error.log what went wrong here
 ```
 
 Paths are resolved relative to your shell's current working directory (tracked automatically via shell integration). Absolute paths also work.
@@ -482,9 +488,9 @@ This is expected. Each handler error is caught and printed; it does not crash th
 Check that the file exists at one of the config paths above. The proxy prints `Failed to load init.lua: ...` to stderr on error.
 
 **ai_query / error_help / workflow_journal does nothing**
-Each plugin needs an LLM provider assigned. Check that the `LLM` palette in `init.lua` has an entry for the provider the plugin references, and that the plugin file sets its `*_LLM` variable. Test with `#ai: hello`.
+Each plugin needs an LLM provider assigned. Check that the `LLM` palette in `init.lua` has an entry for the provider the plugin references, and that the plugin file sets its `*_LLM` variable. Test by pressing Ctrl-G and asking `hello`.
 
-**`#ai: @file` says "cannot open"**
+**`@file` says "cannot open"**
 Paths resolve relative to the shell's CWD, which requires shell integration to be loaded. Without it, paths resolve relative to where ttyrell was launched. Use an absolute path to confirm the file is readable.
 
 **Session log is not being created**

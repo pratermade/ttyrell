@@ -108,17 +108,26 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Ve
                     req = req.set(&k, &v);
                 }
             }
-            match req.send_string(&body) {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.into_string().map_err(mlua::Error::external)?;
-                    Ok((status, text))
+            // Guard the network call so a TLS/transport panic surfaces as a
+            // catchable Lua error instead of unwinding out of the event handler.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match req.send_string(&body) {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        Ok((status, resp.into_string().unwrap_or_default()))
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        Ok((code, resp.into_string().unwrap_or_default()))
+                    }
+                    Err(e) => Err(e.to_string()),
                 }
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    Ok((code, text))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+            }));
+            match outcome {
+                Ok(Ok((status, text))) => Ok((status, text)),
+                Ok(Err(msg)) => Err(mlua::Error::external(msg)),
+                Err(_) => Err(mlua::Error::external(
+                    "http_post panicked (TLS or transport failure)",
+                )),
             }
         },
     )?;
@@ -165,6 +174,61 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Ve
         Ok(())
     })?;
     proxy_table.set("spawn", spawn_fn)?;
+
+    // proxy.spinner_start() / proxy.spinner_stop() — animated "thinking" indicator.
+    // LLM HTTP calls block the Lua thread, so the animation runs on a Rust thread
+    // writing frames directly to stdout at the current cursor position. stop()
+    // joins the thread before returning, so no frame can be written after the
+    // caller's cleanup output.
+    let spinner_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
+    let spinner_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let sh = spinner_handle.clone();
+    let sf = spinner_flag.clone();
+    let spinner_start = lua.create_function(move |_lua, ()| {
+        use std::sync::atomic::Ordering;
+        let mut guard = sh.lock().unwrap();
+        if guard.is_some() {
+            return Ok(()); // already spinning
+        }
+        sf.store(true, Ordering::SeqCst);
+        let flag = sf.clone();
+        *guard = Some(std::thread::spawn(move || {
+            use std::io::Write;
+            const FRAMES: [u8; 4] = [b'\\', b'-', b'/', b'|'];
+            let mut out = std::io::stdout();
+            let mut i = 0usize;
+            let _ = out.write_all(&[FRAMES[0]]);
+            let _ = out.flush();
+            while flag.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                if !flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                i = (i + 1) % FRAMES.len();
+                let _ = out.write_all(&[0x08, FRAMES[i]]);
+                let _ = out.flush();
+            }
+            // Erase the frame character before exiting.
+            let _ = out.write_all(b"\x08 \x08");
+            let _ = out.flush();
+        }));
+        Ok(())
+    })?;
+    proxy_table.set("spinner_start", spinner_start)?;
+
+    let sh2 = spinner_handle.clone();
+    let sf2 = spinner_flag.clone();
+    let spinner_stop = lua.create_function(move |_lua, ()| {
+        use std::sync::atomic::Ordering;
+        sf2.store(false, Ordering::SeqCst);
+        if let Some(h) = sh2.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        Ok(())
+    })?;
+    proxy_table.set("spinner_stop", spinner_stop)?;
 
     // proxy.config.get(key) — placeholder for v0.3
     let config_table = lua.create_table()?;

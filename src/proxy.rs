@@ -20,6 +20,8 @@ pub fn run(
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     let _raw = RawModeGuard::enable();
+    #[cfg(windows)]
+    let _raw = WindowsConsoleGuard::enable();
 
     let pty_system = NativePtySystem::default();
     let size = get_terminal_size();
@@ -32,8 +34,12 @@ pub fn run(
         "TERM",
         std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
     );
+    // Start the shell in the directory ttyrell was launched from.
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
 
-    let _child = slave.spawn_command(cmd)?;
+    let child = slave.spawn_command(cmd)?;
     drop(slave);
 
     let mut reader = master.try_clone_reader()?;
@@ -65,6 +71,16 @@ pub fn run(
                 break;
             }
         }
+    });
+
+    // --- Child waiter: signal shutdown when the shell exits. On Windows ConPTY
+    // the PTY reader does not observe EOF when the child terminates, so `exit`
+    // would otherwise hang; watch the child process directly. ---
+    let child_tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+        let _ = child_tx.send(Message::Eof);
     });
 
     // --- PTY output thread: reads PTY, parses OSC, forwards to stdout and main loop ---
@@ -279,6 +295,117 @@ impl Drop for RawModeGuard {
     }
 }
 
+// ── Windows console raw mode ───────────────────────────────────────────────────
+// Without this the console stays in cooked/line mode: stdin is line-buffered and
+// echoed, so per-keystroke `input` events never fire (input only arrives on Enter)
+// and control keys like Ctrl-G are swallowed. Put stdin into raw + VT-input mode
+// (bytes delivered as typed, no echo) and enable VT output, restoring on drop.
+#[cfg(windows)]
+mod winconsole {
+    pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+    pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+    pub const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    pub const ENABLE_LINE_INPUT: u32 = 0x0002;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    pub const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[repr(C)]
+    pub struct COORD {
+        pub x: i16,
+        pub y: i16,
+    }
+
+    #[repr(C)]
+    pub struct SMALL_RECT {
+        pub left: i16,
+        pub top: i16,
+        pub right: i16,
+        pub bottom: i16,
+    }
+
+    #[repr(C)]
+    pub struct CONSOLE_SCREEN_BUFFER_INFO {
+        pub dw_size: COORD,
+        pub dw_cursor_position: COORD,
+        pub w_attributes: u16,
+        pub sr_window: SMALL_RECT,
+        pub dw_maximum_window_size: COORD,
+    }
+
+    unsafe extern "system" {
+        pub fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+        pub fn GetConsoleMode(h: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: *mut core::ffi::c_void, mode: u32) -> i32;
+        pub fn GetConsoleScreenBufferInfo(
+            h: *mut core::ffi::c_void,
+            info: *mut CONSOLE_SCREEN_BUFFER_INFO,
+        ) -> i32;
+    }
+}
+
+#[cfg(windows)]
+struct WindowsConsoleGuard {
+    stdin: *mut core::ffi::c_void,
+    stdout: *mut core::ffi::c_void,
+    in_mode: u32,
+    out_mode: u32,
+    restore_out: bool,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleGuard {
+    fn enable() -> Option<Self> {
+        use winconsole::*;
+        unsafe {
+            let stdin = GetStdHandle(STD_INPUT_HANDLE);
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+            let mut in_mode = 0u32;
+            if GetConsoleMode(stdin, &mut in_mode) == 0 {
+                // stdin is not a console (piped/redirected) — leave everything alone.
+                return None;
+            }
+
+            let raw_in = (in_mode
+                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            SetConsoleMode(stdin, raw_in);
+
+            let mut out_mode = 0u32;
+            let restore_out = GetConsoleMode(stdout, &mut out_mode) != 0;
+            if restore_out {
+                SetConsoleMode(
+                    stdout,
+                    out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                );
+            }
+
+            Some(WindowsConsoleGuard {
+                stdin,
+                stdout,
+                in_mode,
+                out_mode,
+                restore_out,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsConsoleGuard {
+    fn drop(&mut self) {
+        use winconsole::*;
+        unsafe {
+            SetConsoleMode(self.stdin, self.in_mode);
+            if self.restore_out {
+                SetConsoleMode(self.stdout, self.out_mode);
+            }
+        }
+    }
+}
+
 fn get_hostname() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         return h;
@@ -314,6 +441,28 @@ fn get_terminal_size() -> PtySize {
                 pixel_width: ws.ws_xpixel,
                 pixel_height: ws.ws_ypixel,
             };
+        }
+    }
+    #[cfg(windows)]
+    {
+        use winconsole::*;
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(h, &mut info) != 0 {
+                // Visible window (sr_window), not the buffer (dw_size, which
+                // includes scrollback height).
+                let cols = info.sr_window.right - info.sr_window.left + 1;
+                let rows = info.sr_window.bottom - info.sr_window.top + 1;
+                if cols > 0 && rows > 0 {
+                    return PtySize {
+                        rows: rows as u16,
+                        cols: cols as u16,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    };
+                }
+            }
         }
     }
     PtySize {

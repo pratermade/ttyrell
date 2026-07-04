@@ -128,7 +128,189 @@ enum LlmProvider {
     None,
 }
 
-fn collect_llm_settings() -> LlmProvider {
+// ── Reading existing config for prefill defaults ──────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum LlmKind {
+    Local,
+    OpenAI,
+    Anthropic,
+}
+
+struct ExistingLlm {
+    kind: LlmKind,
+    name: String,    // provider table key (matters for the Local provider ref)
+    endpoint: String,
+    model: String,
+    api_key: String, // literal key, or "" when the config used os.getenv(...)
+}
+
+#[derive(Default)]
+struct ExistingConfig {
+    llm: Option<ExistingLlm>,
+    obsidian_vault: Option<String>,
+}
+
+/// Read a previously installed config so its values can seed the wizard defaults.
+fn read_existing_config(install_root: &Path) -> ExistingConfig {
+    let lua_dir = install_root.join("lua");
+    let mut cfg = ExistingConfig::default();
+    if let Ok(init) = fs::read_to_string(lua_dir.join("init.lua")) {
+        cfg.llm = parse_llm_palette(&init);
+    }
+    if let Ok(wj) = fs::read_to_string(lua_dir.join("plugins").join("workflow_journal.lua")) {
+        cfg.obsidian_vault = parse_obsidian_vault(&wj);
+    }
+    cfg
+}
+
+/// Extract `key = "value"` from a single line (ignoring surrounding whitespace).
+fn parse_string_field(line: &str, key: &str) -> Option<String> {
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    let start = rhs.find('"')?;
+    let rest = &rhs[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract the key from a `<ident> = {` table-opening line.
+fn parse_table_key(line: &str) -> Option<String> {
+    let (lhs, rhs) = line.split_once('=')?;
+    let key = lhs.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    rhs.trim_start().starts_with('{').then(|| key.to_string())
+}
+
+/// Parse the first provider entry from the `LLM = { ... }` palette in init.lua.
+/// Commented-out lines are ignored, so a skipped install parses as None.
+fn parse_llm_palette(content: &str) -> Option<ExistingLlm> {
+    let mut in_palette = false;
+    let mut name: Option<String> = None;
+    let mut endpoint: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut api_key = String::new();
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with("--") {
+            continue;
+        }
+        if !in_palette {
+            if line.starts_with("LLM") && line["LLM".len()..].trim_start().starts_with('=') {
+                in_palette = true;
+            }
+            continue;
+        }
+        if name.is_none() {
+            if let Some(n) = parse_table_key(line) {
+                name = Some(n);
+                continue;
+            }
+        }
+        if endpoint.is_none() {
+            if let Some(v) = parse_string_field(line, "endpoint") {
+                endpoint = Some(v);
+                continue;
+            }
+        }
+        if model.is_none() {
+            if let Some(v) = parse_string_field(line, "model") {
+                model = Some(v);
+                continue;
+            }
+        }
+        if line.starts_with("api_key") && !line.contains("os.getenv") {
+            if let Some(v) = parse_string_field(line, "api_key") {
+                api_key = v;
+            }
+        }
+    }
+
+    let endpoint = endpoint?;
+    let kind = if endpoint.contains("anthropic") {
+        LlmKind::Anthropic
+    } else if endpoint.contains("openai.com") {
+        LlmKind::OpenAI
+    } else {
+        LlmKind::Local
+    };
+    Some(ExistingLlm {
+        kind,
+        name: name.unwrap_or_else(|| "local_llm".to_string()),
+        endpoint,
+        model: model.unwrap_or_default(),
+        api_key,
+    })
+}
+
+/// Parse an active (uncommented) JOURNAL_OBSIDIAN_VAULT assignment.
+fn parse_obsidian_vault(content: &str) -> Option<String> {
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with("--") {
+            continue;
+        }
+        if line.starts_with("JOURNAL_OBSIDIAN_VAULT") {
+            if let Some(v) = parse_string_field(line, "JOURNAL_OBSIDIAN_VAULT") {
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ensure an OpenAI-compatible endpoint targets the chat/completions route.
+/// Users often enter just the base URL (e.g. ".../v1" or ".../v1/") that other
+/// tools append to, but ttyrell POSTs to the URL verbatim — so complete it here.
+fn normalize_completions_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}/chat/completions")
+}
+
+/// Show the last 4 chars of a secret so a default can be confirmed without echoing it.
+fn mask_key(k: &str) -> String {
+    let n = k.chars().count();
+    if n <= 4 {
+        "…".to_string()
+    } else {
+        let tail: String = k.chars().skip(n - 4).collect();
+        format!("…{tail}")
+    }
+}
+
+/// Prompt for an API key. When an existing key is present it is offered as a
+/// masked default (Enter keeps it); typing a new value replaces it.
+fn prompt_api_key(msg: &str, existing: Option<&str>) -> String {
+    match existing {
+        Some(k) if !k.is_empty() => {
+            print!("  \x1b[36m?\x1b[0m {msg} [keep {}]: ", mask_key(k));
+            io::stdout().flush().ok();
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).ok();
+            let s = line.trim().to_string();
+            if s.is_empty() { k.to_string() } else { s }
+        }
+        _ => {
+            print!("  \x1b[36m?\x1b[0m {msg}: ");
+            io::stdout().flush().ok();
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).ok();
+            line.trim().to_string()
+        }
+    }
+}
+
+fn collect_llm_settings(existing: Option<&ExistingLlm>) -> LlmProvider {
     say("LLM provider  (press Enter to skip — configure later in init.lua)");
     println!();
     println!("    1) Local / OpenAI-compatible  (Ollama, llama.cpp, LM Studio, …)");
@@ -136,38 +318,88 @@ fn collect_llm_settings() -> LlmProvider {
     println!("    3) Anthropic (Claude)");
     println!("    4) Skip");
     println!();
-    print!("  \x1b[36m?\x1b[0m Choose [1-4]: ");
-    io::stdout().flush().ok();
 
+    let default_choice = existing.map(|e| match e.kind {
+        LlmKind::Local => "1",
+        LlmKind::OpenAI => "2",
+        LlmKind::Anthropic => "3",
+    });
+    if let Some(e) = existing {
+        let label = match e.kind {
+            LlmKind::Local => "Local / OpenAI-compatible",
+            LlmKind::OpenAI => "OpenAI",
+            LlmKind::Anthropic => "Anthropic (Claude)",
+        };
+        ok(&format!("Current: {label} — {}", e.endpoint));
+    }
+
+    match default_choice {
+        Some(d) => print!("  \x1b[36m?\x1b[0m Choose [1-4] [{d}]: "),
+        None => print!("  \x1b[36m?\x1b[0m Choose [1-4]: "),
+    }
+    io::stdout().flush().ok();
     let mut line = String::new();
     io::stdin().read_line(&mut line).ok();
+    let mut choice = line.trim().to_string();
+    if choice.is_empty() {
+        choice = default_choice.unwrap_or("").to_string();
+    }
 
-    match line.trim() {
+    // Existing values only seed defaults when the chosen provider matches.
+    let same = |k: LlmKind| existing.filter(|e| e.kind == k);
+
+    match choice.as_str() {
         "1" => {
+            let cur = same(LlmKind::Local);
             let endpoint = prompt_input(
-                "Endpoint URL",
-                Some("http://localhost:11434/v1/chat/completions"),
+                "Endpoint URL (a base like .../v1 is auto-completed)",
+                Some(
+                    cur.map(|e| e.endpoint.as_str())
+                        .unwrap_or("http://localhost:11434/v1/chat/completions"),
+                ),
             );
             if endpoint.is_empty() {
                 warn("No endpoint entered — skipping LLM setup.");
                 return LlmProvider::None;
             }
-            let model = prompt_input("Model name", Some("default"));
+            let endpoint = normalize_completions_url(&endpoint);
+            let model = prompt_input(
+                "Model name",
+                Some(
+                    cur.map(|e| e.model.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("default"),
+                ),
+            );
             ok("Local LLM configured");
             LlmProvider::Local {
-                name: "local_llm".into(),
+                name: cur.map(|e| e.name.clone()).unwrap_or_else(|| "local_llm".into()),
                 endpoint,
                 model,
             }
         }
         "2" => {
+            let cur = same(LlmKind::OpenAI);
             let endpoint = prompt_input(
-                "Endpoint URL",
-                Some("https://api.openai.com/v1/chat/completions"),
+                "Endpoint URL (a base like .../v1 is auto-completed)",
+                Some(
+                    cur.map(|e| e.endpoint.as_str())
+                        .unwrap_or("https://api.openai.com/v1/chat/completions"),
+                ),
             );
-            let model = prompt_input("Model name", Some("gpt-4o"));
-            let api_key =
-                prompt_input("API key (blank → use OPENAI_API_KEY env var at runtime)", None);
+            let endpoint = normalize_completions_url(&endpoint);
+            let model = prompt_input(
+                "Model name",
+                Some(
+                    cur.map(|e| e.model.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("gpt-4o"),
+                ),
+            );
+            let api_key = prompt_api_key(
+                "API key (blank → use OPENAI_API_KEY env var at runtime)",
+                cur.map(|e| e.api_key.as_str()),
+            );
             ok("OpenAI configured");
             LlmProvider::OpenAI {
                 endpoint,
@@ -176,10 +408,18 @@ fn collect_llm_settings() -> LlmProvider {
             }
         }
         "3" => {
-            let model = prompt_input("Model name", Some("claude-opus-4-8"));
-            let api_key = prompt_input(
+            let cur = same(LlmKind::Anthropic);
+            let model = prompt_input(
+                "Model name",
+                Some(
+                    cur.map(|e| e.model.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("claude-opus-4-8"),
+                ),
+            );
+            let api_key = prompt_api_key(
                 "API key (blank → use ANTHROPIC_API_KEY env var at runtime)",
-                None,
+                cur.map(|e| e.api_key.as_str()),
             );
             ok("Anthropic/Claude configured");
             LlmProvider::Anthropic { model, api_key }
@@ -708,6 +948,9 @@ pub fn run(force: bool) -> anyhow::Result<()> {
     let has_config = init_lua.exists();
     let has_binary = bin_dest.exists();
 
+    // Read any prior config so its LLM/Obsidian values can seed the wizard defaults.
+    let existing = read_existing_config(&install_root);
+
     // ── Detect / confirm ──────────────────────────────────────────────────────
     let mut keep_config = false;
 
@@ -752,11 +995,16 @@ pub fn run(force: bool) -> anyhow::Result<()> {
         // upgrade=true: support files refreshed, user-edited plugin files preserved
         write_all_files(&install_root, &LlmProvider::None, None, true)?;
     } else {
-        let provider = collect_llm_settings();
+        let provider = collect_llm_settings(existing.llm.as_ref());
 
         say("Obsidian integration  (optional — workflow_journal plugin)");
-        let vault_input = prompt_input("Obsidian vault path (leave blank to skip)", None);
-        let obsidian_vault = if vault_input.is_empty() {
+        let vault_prompt = if existing.obsidian_vault.is_some() {
+            "Obsidian vault path (Enter to keep, '-' to remove)"
+        } else {
+            "Obsidian vault path (leave blank to skip)"
+        };
+        let vault_input = prompt_input(vault_prompt, existing.obsidian_vault.as_deref());
+        let obsidian_vault = if vault_input.is_empty() || vault_input == "-" {
             None
         } else {
             Some(vault_input)
@@ -1087,5 +1335,179 @@ local x = 1\n";
         assert!(out.contains("anthropic.com"));
         assert!(out.contains("ANTHROPIC_API_KEY"));
         assert!(out.contains("parse_response"));
+    }
+
+    // ── parse_string_field / parse_table_key ──────────────────────────────────
+
+    #[test]
+    fn parse_string_field_extracts_value_with_padding() {
+        assert_eq!(
+            parse_string_field("        endpoint = \"http://x/y\",", "endpoint"),
+            Some("http://x/y".to_string())
+        );
+        assert_eq!(
+            parse_string_field("    model    = \"gpt-4o\",", "model"),
+            Some("gpt-4o".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_string_field_rejects_wrong_key() {
+        assert_eq!(parse_string_field("model = \"x\"", "endpoint"), None);
+        assert_eq!(parse_string_field("no_equals_here", "model"), None);
+    }
+
+    #[test]
+    fn parse_table_key_matches_table_opener_only() {
+        assert_eq!(parse_table_key("    local_llama = {"), Some("local_llama".to_string()));
+        assert_eq!(parse_table_key("    endpoint = \"http://x\","), None);
+        assert_eq!(parse_table_key("    [\"x-api-key\"] = cfg.api_key,"), None);
+    }
+
+    // ── parse_llm_palette ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_palette_local() {
+        let src = "\
+LLM = {
+    local_llama = {
+        endpoint = \"http://mint:8083/v1/chat/completions\",
+        model    = \"default\",
+    },
+}
+";
+        let e = parse_llm_palette(src).expect("should parse");
+        assert!(matches!(e.kind, LlmKind::Local));
+        assert_eq!(e.name, "local_llama");
+        assert_eq!(e.endpoint, "http://mint:8083/v1/chat/completions");
+        assert_eq!(e.model, "default");
+        assert_eq!(e.api_key, "");
+    }
+
+    #[test]
+    fn parse_palette_openai_literal_key() {
+        let src = "\
+LLM = {
+    openai = {
+        endpoint = \"https://api.openai.com/v1/chat/completions\",
+        api_key  = \"sk-abc123\",
+        model    = \"gpt-4o\",
+    },
+}
+";
+        let e = parse_llm_palette(src).expect("should parse");
+        assert!(matches!(e.kind, LlmKind::OpenAI));
+        assert_eq!(e.api_key, "sk-abc123");
+        assert_eq!(e.model, "gpt-4o");
+    }
+
+    #[test]
+    fn parse_palette_openai_env_key_is_blank() {
+        let src = "\
+LLM = {
+    openai = {
+        endpoint = \"https://api.openai.com/v1/chat/completions\",
+        api_key  = os.getenv(\"OPENAI_API_KEY\"),
+        model    = \"gpt-4o\",
+    },
+}
+";
+        let e = parse_llm_palette(src).expect("should parse");
+        assert!(matches!(e.kind, LlmKind::OpenAI));
+        assert_eq!(e.api_key, "");
+    }
+
+    #[test]
+    fn parse_palette_anthropic_ignores_nested_functions() {
+        // Mirrors the generated Anthropic block: nested build_request has
+        // `model = cfg.model` which must NOT override the real quoted model.
+        let src = "\
+LLM = {
+    claude = {
+        endpoint = \"https://api.anthropic.com/v1/messages\",
+        api_key  = os.getenv(\"ANTHROPIC_API_KEY\"),
+        model    = \"claude-opus-4-8\",
+        headers  = function(cfg)
+            return {
+                [\"x-api-key\"]         = cfg.api_key,
+                [\"anthropic-version\"] = \"2023-06-01\",
+            }
+        end,
+        build_request = function(cfg, prompt, context)
+            return {
+                model      = cfg.model,
+                max_tokens = 1024,
+            }
+        end,
+    },
+}
+";
+        let e = parse_llm_palette(src).expect("should parse");
+        assert!(matches!(e.kind, LlmKind::Anthropic));
+        assert_eq!(e.model, "claude-opus-4-8");
+        assert_eq!(e.api_key, "");
+    }
+
+    #[test]
+    fn parse_palette_commented_out_is_none() {
+        let src = "\
+-- LLM = {
+--     local_llm = {
+--         endpoint = \"http://localhost:11434/v1/chat/completions\",
+--         model    = \"default\",
+--     },
+-- }
+";
+        assert!(parse_llm_palette(src).is_none());
+    }
+
+    // ── parse_obsidian_vault ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_obsidian_vault_reads_active_line() {
+        let src = "JOURNAL_LLM = LLM.claude\nJOURNAL_OBSIDIAN_VAULT = \"/home/me/vault\"\n";
+        assert_eq!(parse_obsidian_vault(src), Some("/home/me/vault".to_string()));
+    }
+
+    #[test]
+    fn parse_obsidian_vault_ignores_commented_line() {
+        let src = "-- JOURNAL_OBSIDIAN_VAULT = \"/path/to/your/vault\"\n";
+        assert_eq!(parse_obsidian_vault(src), None);
+    }
+
+    // ── normalize_completions_url ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_url_completes_base() {
+        assert_eq!(
+            normalize_completions_url("http://host:8083/v1"),
+            "http://host:8083/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_completions_url("http://host:8083/v1/"),
+            "http://host:8083/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_url_leaves_full_route_untouched() {
+        assert_eq!(
+            normalize_completions_url("http://host:8083/v1/chat/completions"),
+            "http://host:8083/v1/chat/completions"
+        );
+        // Trailing slash on a full route is trimmed but the route is preserved.
+        assert_eq!(
+            normalize_completions_url("http://host:8083/v1/chat/completions/"),
+            "http://host:8083/v1/chat/completions"
+        );
+    }
+
+    // ── mask_key ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mask_key_shows_last_four() {
+        assert_eq!(mask_key("sk-abcdefgh"), "…efgh");
+        assert_eq!(mask_key("abcd"), "…");
+        assert_eq!(mask_key("xy"), "…");
     }
 }

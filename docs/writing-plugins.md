@@ -104,7 +104,7 @@ Fires for every chunk of data the user types. In interactive use each chunk is t
 
 ```lua
 proxy.on("input", function(data)
-    if data:match("^#ai:") then
+    if data:byte(1) == 7 then   -- Ctrl-G
         -- handle it here
         return "suppress"   -- don't forward to shell
     end

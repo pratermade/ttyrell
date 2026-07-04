@@ -7,12 +7,16 @@ edition = "2024"
 portable-pty = "0.8"
 bytes = "1"
 anyhow = "1"
-mlua = { version = "0.11", features = ["lua55", "serialize"] }
+mlua = { version = "0.11", features = ["lua55", "serialize", "vendored"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
 dirs = "6"
 include_dir = "0.7"
+# ureq pulls in rustls 0.23, which panics on the first HTTPS request unless a
+# process-wide crypto provider is installed. Depend on it directly (ring only,
+# no aws-lc-rs) so we can install the default provider at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
