@@ -4,6 +4,11 @@ use mlua::Lua;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 
+/// Atomic flag set by the SIGWINCH signal handler on Unix. The main event loop
+/// polls this and resizes the PTY master when the terminal window changes.
+#[cfg(unix)]
+static NEED_RESIZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 enum Message {
     PtyEvents(Vec<OscEvent>),
     PtyOutput(String),
@@ -22,6 +27,19 @@ pub fn run(
     let _raw = RawModeGuard::enable();
     #[cfg(windows)]
     let _raw = WindowsConsoleGuard::enable();
+
+    // Install a SIGWINCH handler so the PTY learns about terminal resize events.
+    // The handler sets an atomic flag; the main event loop polls it and calls
+    // master.resize(). This is safe: the signal handler only writes to an
+    // AtomicBool (async-signal-safe on all platforms) and libc::signal with
+    // SA_RESTART semantics means interrupted syscalls are transparently retried.
+    #[cfg(unix)]
+    unsafe {
+        extern "C" fn sigwinch_handler(_: libc::c_int) {
+            NEED_RESIZE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        libc::signal(libc::SIGWINCH, sigwinch_handler as *const () as libc::sighandler_t);
+    }
 
     let pty_system = NativePtySystem::default();
     let size = get_terminal_size();
@@ -156,6 +174,17 @@ pub fn run(
 
     // --- Main loop: dispatch all events reactively ---
     loop {
+        // Poll the SIGWINCH flag on Unix. When the terminal window changes size
+        // the signal handler sets this flag, and we propagate the new dimensions
+        // into the PTY so the slave (and shell/TUI inside) sees the up-to-date size.
+        #[cfg(unix)]
+        if NEED_RESIZE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let new_size = get_terminal_size();
+            if let Err(e) = master.resize(new_size) {
+                eprintln!("PTY resize failed: {}", e);
+            }
+        }
+
         match msg_rx.recv() {
             Ok(Message::PtyEvents(events)) => {
                 for event in &events {
@@ -432,15 +461,34 @@ fn get_terminal_size() -> PtySize {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let fd = std::io::stderr().as_raw_fd();
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
-            return PtySize {
-                rows: ws.ws_row,
-                cols: ws.ws_col,
-                pixel_width: ws.ws_xpixel,
-                pixel_height: ws.ws_ypixel,
-            };
+
+        // Prefer /dev/tty — the controlling terminal of the process. Using
+        // stderr alone is fragile: when stderr is redirected or piped its fd
+        // points to the pipe, not the terminal, and TIOCGWINSZ fails.
+        let tty_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+            .map(|f| f.as_raw_fd());
+
+        // Query chain: /dev/tty → stderr → stdin → give up and use default.
+        // All three may be the same underlying fd; trying all is harmless.
+        let fds: Vec<i32> = match tty_fd {
+            Some(fd) => vec![fd, libc::STDERR_FILENO, libc::STDIN_FILENO],
+            None => vec![libc::STDERR_FILENO, libc::STDIN_FILENO],
+        };
+
+        for fd in fds {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+                return PtySize {
+                    rows: ws.ws_row,
+                    cols: ws.ws_col,
+                    pixel_width: ws.ws_xpixel,
+                    pixel_height: ws.ws_ypixel,
+                };
+            }
         }
     }
     #[cfg(windows)]
