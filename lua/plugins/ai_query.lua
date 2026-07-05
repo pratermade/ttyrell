@@ -620,7 +620,7 @@ proxy.on("input", function(data)
     if pending_cmd or pending_write then
         local ch = data:sub(1, 1)
         local b  = ch:byte() or 0
-        local accept  = (ch == "y" or ch == "Y" or ch == "\r" or ch == "\n")
+        local accept  = (ch == "y" or ch == "Y")
         local decline = (b == 27 or ch == "n" or ch == "N")
 
         if pending_write then
