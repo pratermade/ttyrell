@@ -31,6 +31,7 @@ proxy.on_task("summarize", function(log_path, out_path)
         "  session_start — host and shell at proxy launch\n" ..
         "  input         — full command line entered by the user\n" ..
         "  output        — full terminal output for a completed command, includes exit_code\n" ..
+        "  file_write    — a file the user created or edited via the AI (path, action)\n" ..
         "  session_end   — proxy is shutting down"
 
     local summary = llm.query(prompt, SUMMARIZE_LLM, log)
@@ -90,6 +91,11 @@ local function append(entry)
         f:flush()
     end
 end
+
+-- Let other plugins record their own JSONL entries (e.g. ai_query logs a
+-- `file_write` when the user accepts a proposed edit), so those changes show up
+-- in the session summary and daily journal. Cleared at session_end.
+SESSION_LOG_RECORD = append
 
 proxy.on("session_start", function(host, shell)
     append({ type = "session_start", host = host, shell = shell })
@@ -236,6 +242,7 @@ proxy.on("session_end", function()
     flush_output()
     append({ type = "session_end" })
     f:close()
+    SESSION_LOG_RECORD = nil  -- log handle is closed; stop accepting entries
 
     -- Kick off summarization in a detached process so the user gets their prompt
     -- back immediately. The child re-invokes ttyrell in `--task summarize` mode,

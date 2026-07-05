@@ -20,6 +20,13 @@ function global:prompt {
 
     # command_exit with last exit code
     [Console]::Write("${ESC}]133;D;${code}${BEL}")
+    # cwd (OSC 7) so ttyrell resolves @file references and edits against the
+    # actual working directory. Only report real filesystem locations.
+    $loc = $ExecutionContext.SessionState.Path.CurrentLocation
+    if ($loc.Provider.Name -eq 'FileSystem') {
+        $p = $loc.ProviderPath -replace '\\', '/'
+        [Console]::Write("${ESC}]7;file://${env:COMPUTERNAME}/${p}${BEL}")
+    }
     # prompt_start
     [Console]::Write("${ESC}]133;A${BEL}")
 

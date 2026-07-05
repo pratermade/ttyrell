@@ -29,6 +29,7 @@ Rules:
 - Group closely related commands into one task
 - Skip trivial commands: cd, ls, pwd, echo, clear, history
 - If errors were encountered and resolved, note it in one bullet
+- Mention files created or edited (JSONL entries with type=file_write): list the path and whether it was created or edited
 - If a task was abandoned with no result, omit it]]
 --
 -- LLM provider for journal entries — pick from the palette defined in init.lua:
@@ -110,12 +111,13 @@ proxy.on("session_end", function()
     local log_path = CURRENT_SESSION_LOG
     if not log_path then return end
 
-    -- Only journal sessions that contain at least one command
+    -- Only journal sessions with at least one command or file change
     local lf = io.open(log_path, "r")
     if not lf then return end
     local content = lf:read("*a")
     lf:close()
-    if not content:find('"input"', 1, true) then return end
+    if not (content:find('"input"', 1, true)
+        or content:find('"file_write"', 1, true)) then return end
 
     local duration = math.max(1, os.time() - session_start)
     local bin = (TTYRELL_BIN or "ttyrell"):gsub('"', '')

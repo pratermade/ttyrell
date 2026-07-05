@@ -9,7 +9,16 @@
 -- Press Esc or Ctrl-C to cancel. The AI sees recent session history as context,
 -- and is told which shell/OS you run so suggested commands use valid syntax.
 -- If the AI can provide a runnable command it appends "EXEC: <cmd>" — ttyrell
--- shows it and asks [y/N] before running anything.
+-- shows it and asks before running anything.
+--
+-- ── File editing ──────────────────────────────────────────────────────────────
+-- Ask to create/edit a file and the AI returns the full new contents; ttyrell
+-- shows a unified diff and writes it only if you confirm ([y]/Enter). Reference
+-- the current file with @path so the AI can edit it. Overwrites are backed up to
+-- <data>/ttyrell/backups/ first, and each write is logged so the daily journal
+-- summarizes what changed.
+--   [ai]> @notes.md add a "Done" section
+--   [ai]> create scripts/build.sh that runs cargo build --release
 --
 -- On Windows the transient UI (the "[ai]> " prompt, your typing, and the
 -- thinking spinner) is drawn in the terminal's alternate screen buffer, then
@@ -49,6 +58,8 @@ AI_QUERY_LLM = LLM.local_llama
 
 local llm = require("llm")
 
+local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+
 local CONTEXT_LINES = (type(AI_CONTEXT_LINES) == "number" and AI_CONTEXT_LINES > 0)
     and AI_CONTEXT_LINES or 64
 
@@ -60,6 +71,9 @@ local HOTKEY = (type(AI_QUERY_HOTKEY) == "number") and AI_QUERY_HOTKEY or 7
 local current_dir = os.getenv("PWD") or "."
 
 proxy.on("cwd_changed", function(dir)
+    -- OSC 7 delivers a file URI path; on Windows that arrives as "/C:/Users/..."
+    -- — strip the leading slash so it's a native path io.open accepts.
+    if IS_WINDOWS then dir = dir:gsub("^/(%a:)", "%1") end
     current_dir = dir
 end)
 
@@ -99,7 +113,8 @@ end
 
 --- Resolve a path relative to the shell's current directory.
 local function resolve_path(path)
-    if path:sub(1, 1) == "/" then return path end  -- already absolute
+    if path:sub(1, 1) == "/" then return path end                  -- POSIX absolute
+    if IS_WINDOWS and path:match("^%a:[/\\]") then return path end  -- Windows absolute (C:\ or C:/)
     return current_dir .. "/" .. path
 end
 
@@ -191,16 +206,15 @@ end
 
 -- ── Query handler ─────────────────────────────────────────────────────────────
 
-local IS_WINDOWS = package.config:sub(1, 1) == "\\"
-
 local ESC       = string.char(27)
 local ENTER_ALT = ESC .. "[?1049h" .. ESC .. "[H"  -- alt-screen buffer + home
 local LEAVE_ALT = ESC .. "[?1049l"                 -- back to the main screen
 
-local pending_cmd = nil   -- awaiting confirmation for an EXEC command
-local capturing   = false -- true while reading an "[ai]> " question line
-local ai_buf      = {}    -- keystrokes typed while capturing
-local input_dirty = false -- shell line likely has pending text the user typed
+local pending_cmd   = nil -- awaiting confirmation for an EXEC command
+local pending_write = nil -- awaiting confirmation for a proposed file write
+local capturing     = false -- true while reading an "[ai]> " question line
+local ai_buf        = {}  -- keystrokes typed while capturing
+local input_dirty   = false -- shell line likely has pending text the user typed
 
 -- Shared with session_log: while true, the keystrokes belong to the AI prompt and
 -- must not be recorded as shell input. session_log is loaded first, so it sees the
@@ -208,7 +222,7 @@ local input_dirty = false -- shell line likely has pending text the user typed
 AI_QUERY_CAPTURING = false
 
 local function sync_capture_flag()
-    AI_QUERY_CAPTURING = capturing or (pending_cmd ~= nil)
+    AI_QUERY_CAPTURING = capturing or (pending_cmd ~= nil) or (pending_write ~= nil)
 end
 
 -- ── Windows response display ──────────────────────────────────────────────────
@@ -243,6 +257,169 @@ local function display_command()
     end
     return 'type "%LOCALAPPDATA%\\ttyrell\\ai_last.txt"'  -- cmd.exe
 end
+
+--- Write text to the Windows display file (BOM for PowerShell, CRLF line ends).
+local function write_display_file(text)
+    local body = text:gsub("\r\n", "\n"):gsub("\n", "\r\n")
+    local f = io.open(AI_FILE_PATH, "wb")
+    if f then
+        if shell_is_powershell() then f:write("\239\187\191") end
+        f:write(body)
+        f:close()
+    end
+end
+
+-- ── File editing (create / edit with diff, backup, and logging) ───────────────
+
+-- ttyrell's data dir (session_log uses the same layout); backups live under it.
+local DATA_DIR = IS_WINDOWS
+    and ((os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or ""):gsub("\\", "/") .. "/ttyrell")
+    or ((os.getenv("HOME") or ".") .. "/.local/share/ttyrell")
+local BACKUP_DIR = DATA_DIR .. "/backups"
+
+local function mkdir_p(path)
+    if IS_WINDOWS then
+        os.execute('mkdir "' .. path:gsub("/", "\\") .. '" 2>nul')
+    else
+        os.execute('mkdir -p "' .. path .. '"')
+    end
+end
+
+--- Read a whole file's contents, or nil if it doesn't exist / can't be opened.
+local function read_file_raw(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    return content
+end
+
+--- Colored, unified-style line diff between two texts. A new file (old == "")
+-- shows every line as an addition. Long unchanged runs collapse to a "…".
+local MAX_DIFF_LINES = 1500
+local function unified_diff(old_text, new_text)
+    local function split(s)
+        local t = {}
+        if s ~= "" then
+            for line in (s .. "\n"):gmatch("([^\n]*)\n") do t[#t + 1] = line end
+        end
+        return t
+    end
+    local a, b = split(old_text or ""), split(new_text or "")
+
+    if #a > MAX_DIFF_LINES or #b > MAX_DIFF_LINES then
+        return string.format("(file too large to diff — %d → %d lines)", #a, #b)
+    end
+
+    -- Suffix-LCS table: dp[i][j] = LCS length of a[i+1..] and b[j+1..].
+    local dp = {}
+    for i = 0, #a do dp[i] = {}; dp[i][#b] = 0 end
+    for j = 0, #b do dp[#a][j] = 0 end
+    for i = #a - 1, 0, -1 do
+        for j = #b - 1, 0, -1 do
+            if a[i + 1] == b[j + 1] then
+                dp[i][j] = dp[i + 1][j + 1] + 1
+            else
+                dp[i][j] = math.max(dp[i + 1][j], dp[i][j + 1])
+            end
+        end
+    end
+
+    local rows = {}
+    local i, j = 0, 0
+    while i < #a and j < #b do
+        if a[i + 1] == b[j + 1] then
+            rows[#rows + 1] = { " ", a[i + 1] }; i = i + 1; j = j + 1
+        elseif dp[i + 1][j] >= dp[i][j + 1] then
+            rows[#rows + 1] = { "-", a[i + 1] }; i = i + 1
+        else
+            rows[#rows + 1] = { "+", b[j + 1] }; j = j + 1
+        end
+    end
+    while i < #a do rows[#rows + 1] = { "-", a[i + 1] }; i = i + 1 end
+    while j < #b do rows[#rows + 1] = { "+", b[j + 1] }; j = j + 1 end
+
+    -- Keep changed lines plus a few lines of context around each.
+    local CTX, keep = 3, {}
+    for idx, r in ipairs(rows) do
+        if r[1] ~= " " then
+            for k = math.max(1, idx - CTX), math.min(#rows, idx + CTX) do keep[k] = true end
+        end
+    end
+
+    local RED, GRN, DIM, RST = ESC .. "[31m", ESC .. "[32m", ESC .. "[90m", ESC .. "[0m"
+    local out, gap = {}, false
+    for idx, r in ipairs(rows) do
+        if keep[idx] then
+            gap = false
+            if r[1] == "+" then
+                out[#out + 1] = GRN .. "+" .. r[2] .. RST
+            elseif r[1] == "-" then
+                out[#out + 1] = RED .. "-" .. r[2] .. RST
+            else
+                out[#out + 1] = DIM .. " " .. r[2] .. RST
+            end
+        elseif not gap then
+            out[#out + 1] = DIM .. "…" .. RST
+            gap = true
+        end
+    end
+    if #out == 0 then return "(no changes)" end
+    return table.concat(out, "\n")
+end
+
+--- Save old contents to a timestamped backup; returns the backup path or nil.
+local function backup_file(orig_path, old_content)
+    mkdir_p(BACKUP_DIR)
+    local flat = orig_path:gsub("[/\\:]", "_"):gsub("^_+", "")
+    local bpath = BACKUP_DIR .. "/" .. os.date("%Y-%m-%d_%H-%M-%S") .. "__" .. flat
+    local f = io.open(bpath, "wb")
+    if not f then return nil end
+    f:write(old_content or "")
+    f:close()
+    return bpath
+end
+
+--- Apply a confirmed write: back up the old file, create/overwrite it, and log
+-- the change so the session summary / journal picks it up. Returns a status line.
+local function apply_write(w)
+    local backup = nil
+    if w.existed then backup = backup_file(w.resolved, w.old) end
+
+    local dir = w.resolved:match("^(.*)[/\\][^/\\]+$")
+    if dir and dir ~= "" then mkdir_p(dir) end
+
+    local f, ferr = io.open(w.resolved, "wb")
+    if not f then return "[ai] write failed: " .. tostring(ferr) end
+    f:write(w.content)
+    f:close()
+
+    if SESSION_LOG_RECORD then
+        pcall(SESSION_LOG_RECORD, {
+            type   = "file_write",
+            path   = w.path,
+            action = w.existed and "edit" or "create",
+            backup = backup,
+        })
+    end
+
+    local msg = "[ai] " .. (w.existed and "updated " or "created ") .. w.path
+    if backup then msg = msg .. "  (backup: " .. backup .. ")" end
+    return msg
+end
+
+local FILE_WRITE_INSTRUCTIONS =
+    "If the user asks you to create, edit, or update a file, output the file's " ..
+    "COMPLETE new contents at the very end of your response, wrapped EXACTLY like " ..
+    "this, with nothing after the end marker and no surrounding code fences:\n" ..
+    "<<<FILE relative/path.ext>>>\n" ..
+    "<the entire new file contents>\n" ..
+    "<<<ENDFILE>>>\n" ..
+    "Use a path relative to the working directory (absolute also works). For an " ..
+    "edit, include the whole file with your changes applied — the current contents " ..
+    "are provided above when the user references the file with @. Only include a " ..
+    "FILE block when a file should actually be written; the user sees a diff and " ..
+    "confirms before anything is saved. Do not also include an EXEC line.\n\n"
 
 local EXEC_INSTRUCTIONS =
     "If the user asks for a command, or a single shell command would answer or " ..
@@ -298,7 +475,7 @@ local function query_llm(raw)
 
     local context = #context_parts > 0 and table.concat(context_parts, "\n\n") or nil
 
-    local prompt = shell_note() .. EXEC_INSTRUCTIONS
+    local prompt = shell_note() .. FILE_WRITE_INSTRUCTIONS .. EXEC_INSTRUCTIONS
     if context then
         prompt = prompt .. context .. "\n\nQuestion: " .. question
     else
@@ -307,7 +484,22 @@ local function query_llm(raw)
 
     local response, err = llm.query(prompt, AI_QUERY_LLM)
     if err then
-        return nil, nil, notes, err
+        return nil, nil, nil, notes, err
+    end
+
+    -- A file-write proposal takes precedence over EXEC.
+    local wpath, wcontent = response:match("<<<FILE%s+(.-)%s*>>>\n(.-)\n<<<ENDFILE>>>")
+    if wpath and wpath ~= "" then
+        -- Defensive: strip a wrapping code fence if the model added one anyway.
+        wcontent = wcontent:gsub("^```[%w]*\n", ""):gsub("\n```%s*$", "")
+        local body = response:gsub("<<<FILE.-<<<ENDFILE>>>", ""):gsub("%s*$", "")
+        local resolved = resolve_path(wpath)
+        local old = read_file_raw(resolved)  -- nil ⇒ new file
+        local write = {
+            path = wpath, resolved = resolved, content = wcontent,
+            existed = old ~= nil, old = old, diff = unified_diff(old or "", wcontent),
+        }
+        return body, nil, write, notes, nil
     end
 
     local exec_cmd = response:match("\nEXEC:%s*([^\n]+)%s*$")
@@ -317,12 +509,12 @@ local function query_llm(raw)
         exec_cmd = exec_cmd:match("^%s*(.-)%s*$")
         body = response:gsub("\n?EXEC:%s*[^\n]+%s*$", ""):gsub("%s*$", "")
     end
-    return body, exec_cmd, notes, nil
+    return body, exec_cmd, nil, notes, nil
 end
 
 --- Unix: inject the response inline (a Unix PTY has no screen model, so this
--- is safe). Sets pending_cmd when the model suggested a command.
-local function show_response_unix(body, exec_cmd, notes, err)
+-- is safe). Sets pending_cmd / pending_write when the model proposes an action.
+local function show_response_unix(body, exec_cmd, write, notes, err)
     for _, n in ipairs(notes) do
         proxy.inject_output("[ai] " .. n .. "\r\n")
     end
@@ -333,7 +525,13 @@ local function show_response_unix(body, exec_cmd, notes, err)
     if #body > 0 then
         proxy.inject_output("[ai] " .. body:gsub("\n", "\r\n") .. "\r\n")
     end
-    if exec_cmd then
+    if write then
+        proxy.inject_output("[ai] " .. (write.existed and "edit " or "create ")
+            .. write.path .. ":\r\n")
+        proxy.inject_output(write.diff:gsub("\n", "\r\n") .. "\r\n")
+        proxy.inject_output("[ai] apply change? [y] ")
+        pending_write = write
+    elseif exec_cmd then
         proxy.inject_output("[ai] run: " .. exec_cmd .. " — run it? [y] ")
         pending_cmd = exec_cmd
     end
@@ -344,7 +542,7 @@ end
 -- The shell prints the response (ConPTY stays in sync) and returns a fresh
 -- prompt on its own. Sets pending_cmd when the model suggested a command; the
 -- run-it hint is part of the displayed text and pressing y/Enter runs it.
-local function show_response_windows(question, body, exec_cmd, notes, err)
+local function show_response_windows(question, body, exec_cmd, write, notes, err)
     local parts = { "[ai] " .. question, "" }
     for _, n in ipairs(notes) do
         table.insert(parts, "note: " .. n)
@@ -353,22 +551,21 @@ local function show_response_windows(question, body, exec_cmd, notes, err)
         table.insert(parts, "error: " .. err)
     else
         if #body > 0 then table.insert(parts, body) end
-        if exec_cmd then
+        if write then
+            table.insert(parts, "")
+            table.insert(parts, (write.existed and "── edit " or "── create ")
+                .. write.path .. " ──")
+            table.insert(parts, write.diff)
+            table.insert(parts, "")
+            table.insert(parts, "apply change? [y]")
+        elseif exec_cmd then
             table.insert(parts, "")
             table.insert(parts, "run: " .. exec_cmd)
             table.insert(parts, "run it? [y]")
         end
     end
 
-    local text = table.concat(parts, "\n"):gsub("\r\n", "\n"):gsub("\n", "\r\n") .. "\r\n"
-    local f = io.open(AI_FILE_PATH, "wb")
-    if f then
-        -- BOM so PowerShell 5.1's Get-Content reads the file as UTF-8;
-        -- cmd.exe's type would print the BOM as garbage, so omit it there.
-        if shell_is_powershell() then f:write("\239\187\191") end
-        f:write(text)
-        f:close()
-    end
+    write_display_file(table.concat(parts, "\n") .. "\n")
 
     -- Return to the main screen, then let the shell display the response.
     proxy.inject_output(LEAVE_ALT)
@@ -384,8 +581,12 @@ local function show_response_windows(question, body, exec_cmd, notes, err)
     end
     proxy.send_input(prefix .. display_command() .. "\r")
 
-    if not err and exec_cmd then
-        pending_cmd = exec_cmd
+    if not err then
+        if write then
+            pending_write = write
+        elseif exec_cmd then
+            pending_cmd = exec_cmd
+        end
     end
 end
 
@@ -401,22 +602,43 @@ local function cancel_capture(note)
 end
 
 proxy.on("input", function(data)
-    -- Awaiting confirmation for a suggested EXEC command.
-    -- y or Enter runs it; n/Esc declines; anything else declines AND passes the
-    -- keystroke through, so just typing your next command works naturally.
-    if pending_cmd then
-        local cmd = pending_cmd
-        pending_cmd = nil
+    -- Awaiting confirmation for a proposed action (an EXEC command or a file
+    -- write). y/Enter applies; n/Esc declines; any other key declines AND passes
+    -- through, so you can just start typing your next command.
+    if pending_cmd or pending_write then
         local ch = data:sub(1, 1)
         local b  = ch:byte() or 0
+        local accept  = (ch == "y" or ch == "Y" or ch == "\r" or ch == "\n")
+        local decline = (b == 27 or ch == "n" or ch == "N")
+
+        if pending_write then
+            local w = pending_write
+            pending_write = nil
+            sync_capture_flag()
+            if accept or decline then
+                local msg = accept and apply_write(w) or "[ai] discarded"
+                if IS_WINDOWS then
+                    write_display_file(msg .. "\r\n")
+                    proxy.send_input(display_command() .. "\r")
+                else
+                    proxy.inject_output("\r\n" .. msg .. "\r\n")
+                end
+                return "suppress"
+            end
+            input_dirty = true  -- forwarded key starts a new shell line
+            return
+        end
+
+        local cmd = pending_cmd
+        pending_cmd = nil
         sync_capture_flag()
-        if ch == "y" or ch == "Y" or ch == "\r" or ch == "\n" then
+        if accept then
             if not IS_WINDOWS then proxy.inject_output("y\r\n") end
             -- \r, not \n: PSReadLine only accepts a line on Enter (\r);
             -- \n is Ctrl-J which is unbound. \r works in readline/zsh too.
             proxy.send_input(cmd .. "\r")
             return "suppress"
-        elseif b == 27 or ch == "n" or ch == "N" then
+        elseif decline then
             if not IS_WINDOWS then proxy.inject_output("N\r\n[ai] cancelled\r\n") end
             return "suppress"
         end
@@ -444,13 +666,13 @@ proxy.on("input", function(data)
                     -- Windows this is inside the alternate screen buffer.
                     proxy.inject_output("\r\n[ai] thinking ")
                     if proxy.spinner_start then proxy.spinner_start() end
-                    local body, exec_cmd, notes, qerr = query_llm(q)
+                    local body, exec_cmd, write, notes, qerr = query_llm(q)
                     if proxy.spinner_stop then proxy.spinner_stop() end
                     if IS_WINDOWS then
-                        show_response_windows(q, body or "", exec_cmd, notes, qerr)
+                        show_response_windows(q, body or "", exec_cmd, write, notes, qerr)
                     else
                         proxy.inject_output("\r\n")
-                        show_response_unix(body or "", exec_cmd, notes, qerr)
+                        show_response_unix(body or "", exec_cmd, write, notes, qerr)
                     end
                 else
                     cancel_capture("\r\n")  -- empty question
