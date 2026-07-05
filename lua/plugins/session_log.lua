@@ -6,7 +6,41 @@
 -- Log:     ~/.local/share/ttyrell/sessions/YYYY-MM-DD_HH-MM-SS.jsonl
 -- Summary: ~/.local/share/ttyrell/summaries/YYYY-MM-DD_HH-MM-SS.txt
 
-if TTYRELL_MODE then return end  -- skip in all background modes (summarize, journal, …)
+-- LLM provider used to summarize the session at exit. Set to nil to disable.
+SUMMARIZE_LLM = LLM.local_llama
+
+-- Background task: write a plain-English summary of a session log. Registered
+-- above the mode guard so it exists when `ttyrell --task summarize` re-invokes
+-- this plugin in a detached process. All logic lives here in Lua.
+proxy.on_task("summarize", function(log_path, out_path)
+    local ok, llm = pcall(require, "llm")
+    if not (ok and llm) or not SUMMARIZE_LLM then return end
+
+    local lf = io.open(log_path, "r")
+    if not lf then return end
+    local log = lf:read("*a")
+    lf:close()
+    if log:gsub("%s", "") == "" then return end
+
+    local prompt =
+        "Summarize this terminal session log in plain English. " ..
+        "Note what machine(s) were used (look for ssh commands and remote prompts), " ..
+        "what was accomplished, and highlight any errors or non-zero exit codes. " ..
+        "Be concise — a short paragraph is ideal.\n\n" ..
+        "The log is JSONL. Each line has a 'type' field:\n" ..
+        "  session_start — host and shell at proxy launch\n" ..
+        "  input         — full command line entered by the user\n" ..
+        "  output        — full terminal output for a completed command, includes exit_code\n" ..
+        "  session_end   — proxy is shutting down"
+
+    local summary = llm.query(prompt, SUMMARIZE_LLM, log)
+    if not summary then return end
+
+    local f = io.open(out_path, "w")
+    if f then f:write(summary .. "\n"); f:close() end
+end)
+
+if TTYRELL_MODE then return end  -- registered our task above; skip interactive logging
 
 local _ok_sg, _sg = pcall(require, "secret_guard")
 local sanitize = (_ok_sg and _sg and _sg.sanitize) or function(t) return t end
@@ -203,15 +237,14 @@ proxy.on("session_end", function()
     append({ type = "session_end" })
     f:close()
 
-    -- Kick off summarization in a background process so the user gets their
-    -- prompt back immediately. The child re-invokes ttyrell in --summarize mode,
-    -- which loads init.lua (for LLM config) and calls llm.query(), then exits.
-    local ok, llm = pcall(require, "llm")
-    if not (ok and llm) then return end
+    -- Kick off summarization in a detached process so the user gets their prompt
+    -- back immediately. The child re-invokes ttyrell in `--task summarize` mode,
+    -- which loads init.lua and runs the handler registered above, then exits.
+    if not SUMMARIZE_LLM then return end
 
     local summary_path = base_dir .. "/summaries/" .. stamp .. ".txt"
     local bin = (TTYRELL_BIN or "ttyrell"):gsub('"', '')
-    proxy.spawn(string.format('"%s" --summarize "%s" "%s"',
+    proxy.spawn(string.format('"%s" --task summarize "%s" "%s"',
         bin, session_path, summary_path))
     proxy.inject_output(
         "\r\n[session_log] summarizing in background → summaries/" .. stamp .. ".txt\r\n"

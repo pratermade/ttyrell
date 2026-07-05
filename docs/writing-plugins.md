@@ -314,6 +314,43 @@ proxy.session_info.pid      -- 12345
 
 ---
 
+## Background tasks (post-session LLM work)
+
+Some plugins need slow work *after* the session ends — e.g. calling an LLM to summarize the session. Doing that inline would make `exit` hang. Instead, spawn a **detached** copy of ttyrell that re-runs your plugin in "task mode". No Rust changes are needed — the whole mechanism is Lua.
+
+1. Register a task handler with `proxy.on_task(name, fn)` at the top of your plugin file, **above** any `if TTYRELL_MODE then return end` guard, so it still registers when the plugin is re-loaded in the detached process.
+2. From an interactive handler (e.g. `session_end`), fire-and-forget with `proxy.spawn`.
+
+ttyrell re-invokes itself as `ttyrell --task <name> [args...]`: it loads `init.lua` (so every plugin registers), sets the global `TTYRELL_MODE = "task"` (so plugins skip interactive wiring), then calls `proxy.tasks[<name>](args...)` with the remaining CLI arguments passed as **strings**. An unregistered name is a silent no-op.
+
+```lua
+-- notify.lua — POST a one-line session summary to a webhook at exit
+proxy.on_task("notify", function(log_path)
+    local f = io.open(log_path); if not f then return end
+    local log = f:read("*a"); f:close()
+    local summary = require("llm").query("One-line summary of this session:", NOTIFY_LLM, log)
+    if summary then
+        proxy.http_post("https://hooks.example/…", proxy.json_encode({ text = summary }))
+    end
+end)
+
+if TTYRELL_MODE then return end   -- everything below is interactive-only
+
+proxy.on("session_end", function()
+    proxy.spawn(string.format('"%s" --task notify "%s"', TTYRELL_BIN, CURRENT_SESSION_LOG))
+end)
+```
+
+Notes:
+- `TTYRELL_BIN` is a global set to ttyrell's own executable path.
+- `proxy.spawn` runs the child fully detached (no console), so `exit` returns immediately and the task outlives the session.
+- Arguments arrive as strings — convert with `tonumber(...)` as needed.
+- `CURRENT_SESSION_LOG` is the current session-log path (set by `session_log`).
+
+The built-in `session_log` (summary) and `workflow_journal` (journal) plugins use exactly this pattern.
+
+---
+
 ## Input suppression
 
 Returning `"suppress"` from an `input` handler blocks the data from being forwarded to the shell. Use this to implement custom commands that the shell never sees.

@@ -18,21 +18,17 @@ fn main() -> anyhow::Result<()> {
         return install::run(force_install);
     }
 
-    // --summarize <log_path> <out_path>
-    let summarize_args = args.iter().position(|a| a == "--summarize").map(|pos| {
-        (
-            args.get(pos + 1).cloned().unwrap_or_default(),
-            args.get(pos + 2).cloned().unwrap_or_default(),
-        )
-    });
-
-    // --journal <log_path> <journal_path> <duration_secs>
-    let journal_args = args.iter().position(|a| a == "--journal").map(|pos| {
-        (
-            args.get(pos + 1).cloned().unwrap_or_default(),
-            args.get(pos + 2).cloned().unwrap_or_default(),
-            args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-        )
+    // --task <name> [args...] — run a plugin-registered background task, then exit.
+    // Plugins (session_log, workflow_journal, …) re-invoke ttyrell this way at
+    // session end so slow LLM work runs detached. All task logic lives in Lua;
+    // adding a new background task needs no changes here.
+    let task_args = args.iter().position(|a| a == "--task").map(|pos| {
+        let name = args.get(pos + 1).cloned().unwrap_or_default();
+        let rest: Vec<String> = args
+            .get(pos + 2..)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        (name, rest)
     });
 
     let (lua, registry, send_input_rx) = lua_api::init_lua()
@@ -47,11 +43,10 @@ fn main() -> anyhow::Result<()> {
     lua.globals().set("TTYRELL_BIN", exe_path)
         .map_err(|e| anyhow::anyhow!("Failed to set TTYRELL_BIN: {}", e))?;
 
-    if summarize_args.is_some() {
-        lua.globals().set("TTYRELL_MODE", "summarize")
-            .map_err(|e| anyhow::anyhow!("Failed to set TTYRELL_MODE: {}", e))?;
-    } else if journal_args.is_some() {
-        lua.globals().set("TTYRELL_MODE", "journal")
+    if task_args.is_some() {
+        // Signals plugins to register their task handlers but skip interactive
+        // wiring (session logging, prompts, etc.).
+        lua.globals().set("TTYRELL_MODE", "task")
             .map_err(|e| anyhow::anyhow!("Failed to set TTYRELL_MODE: {}", e))?;
     }
 
@@ -89,14 +84,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some((log_path, out_path)) = summarize_args {
+    if let Some((name, task_argv)) = task_args {
         drop(send_input_rx);
-        return run_summarize(&lua, &log_path, &out_path);
-    }
-
-    if let Some((log_path, journal_path, duration_secs)) = journal_args {
-        drop(send_input_rx);
-        return run_journal(&lua, &log_path, &journal_path, duration_secs);
+        return run_task(&lua, &name, &task_argv);
     }
 
     // Run the PTY proxy
@@ -207,109 +197,28 @@ fn detect_parent_shell() -> Option<String> {
     }
 }
 
-fn run_journal(lua: &mlua::Lua, log_path: &str, journal_path: &str, duration_secs: u64) -> anyhow::Result<()> {
-    let log = std::fs::read_to_string(log_path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", log_path, e))?;
+/// Run a plugin-registered background task: `proxy.tasks[name](args...)`.
+/// The task's logic lives entirely in the Lua plugin that registered it (via
+/// proxy.on_task); an unregistered name is a no-op (its plugin isn't loaded).
+fn run_task(lua: &mlua::Lua, name: &str, args: &[String]) -> anyhow::Result<()> {
+    let handler = (|| -> mlua::Result<Option<mlua::Function>> {
+        let proxy: mlua::Table = lua.globals().get("proxy")?;
+        let tasks: mlua::Table = proxy.get("tasks")?;
+        tasks.get(name)
+    })()
+    .map_err(|e| anyhow::anyhow!("look up task '{}': {}", name, e))?;
 
-    if log.trim().is_empty() {
+    let Some(handler) = handler else {
         return Ok(());
-    }
-
-    let mins = duration_secs / 60;
-    let secs = duration_secs % 60;
-    let duration_str = if mins > 0 {
-        format!("{}m {}s", mins, secs)
-    } else {
-        format!("{}s", secs)
     };
 
-    lua.globals().set("__journal_log__", log)
-        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
-    lua.globals().set("__journal_path__", journal_path)
-        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
-    lua.globals().set("__journal_duration__", duration_str)
-        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
-
-    lua.load(r#"
-        local ok, llm = pcall(require, 'llm')
-        if not (ok and llm) then return end
-
-        if not JOURNAL_PROMPT then
-            io.stderr:write('[journal] JOURNAL_PROMPT not set - is workflow_journal.lua loaded?\n')
-            return
-        end
-        local prompt = JOURNAL_PROMPT .. '\n- Session duration: ' .. __journal_duration__
-        local tasks, err = llm.query(prompt, JOURNAL_LLM, __journal_log__)
-        if not tasks then return end
-
-        local tasks_clean = tasks:gsub('%s*$', '')
-        local date_str    = os.date('%Y-%m-%d %H:%M')
-
-        -- Main journal file (full date + time heading)
-        local entry = '## ' .. date_str .. ' -- ' .. __journal_duration__ .. '\n\n'
-                   .. tasks_clean .. '\n\n---\n\n'
-        local f = io.open(__journal_path__, 'a')
-        if f then f:write(entry); f:close() end
-
-        -- Obsidian daily note (time-only heading; date is the filename)
-        if JOURNAL_OBSIDIAN_VAULT then
-            local sub_dir = JOURNAL_OBSIDIAN_DIR or 'Work Journal'
-            local vault_dir = JOURNAL_OBSIDIAN_VAULT .. '/' .. sub_dir
-            if package.config:sub(1, 1) == '\\' then
-                os.execute('mkdir "' .. vault_dir:gsub('/', '\\') .. '" 2>nul')
-            else
-                os.execute('mkdir -p "' .. vault_dir .. '"')
-            end
-
-            local daily_file = vault_dir .. '/' .. os.date('%Y-%m-%d') .. '.md'
-            local obs_entry  = '## ' .. os.date('%H:%M') .. ' -- ' .. __journal_duration__ .. '\n\n'
-                            .. tasks_clean .. '\n\n---\n\n'
-            local of = io.open(daily_file, 'a')
-            if of then of:write(obs_entry); of:close() end
-        end
-    "#).exec().map_err(|e| anyhow::anyhow!("journal lua: {}", e))?;
-
-    Ok(())
-}
-
-fn run_summarize(lua: &mlua::Lua, log_path: &str, out_path: &str) -> anyhow::Result<()> {
-    let log = std::fs::read_to_string(log_path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", log_path, e))?;
-
-    if log.trim().is_empty() {
-        return Ok(());
-    }
-
-    lua.globals().set("__summarize_log__", log)
-        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
-    lua.globals().set("__summarize_out__", out_path)
-        .map_err(|e| anyhow::anyhow!("lua globals: {}", e))?;
-
-    lua.load(r#"
-        local ok, llm = pcall(require, "llm")
-        if not (ok and llm) then return end
-
-        local summary, err = llm.query(
-            "Summarize this terminal session log in plain English. " ..
-            "Note what machine(s) were used (look for ssh commands and remote prompts), " ..
-            "what was accomplished, and highlight any errors or non-zero exit codes. " ..
-            "Be concise — a short paragraph is ideal.\n\n" ..
-            "The log is JSONL. Each line has a 'type' field:\n" ..
-            "  session_start — host and shell at proxy launch\n" ..
-            "  input         — full command line entered by the user\n" ..
-            "  output        — full terminal output for a completed command, includes exit_code\n" ..
-            "  session_end   — proxy is shutting down\n\n" ..
-            __summarize_log__
-        )
-
-        if not summary then return end
-
-        local f = io.open(__summarize_out__, "w")
-        if f then
-            f:write(summary .. "\n")
-            f:close()
-        end
-    "#).exec().map_err(|e| anyhow::anyhow!("summarize lua: {}", e))?;
-
+    let lua_args = args
+        .iter()
+        .map(|s| lua.create_string(s).map(mlua::Value::String))
+        .collect::<mlua::Result<Vec<_>>>()
+        .map_err(|e| anyhow::anyhow!("task args: {}", e))?;
+    handler
+        .call::<()>(mlua::MultiValue::from_vec(lua_args))
+        .map_err(|e| anyhow::anyhow!("task '{}': {}", name, e))?;
     Ok(())
 }

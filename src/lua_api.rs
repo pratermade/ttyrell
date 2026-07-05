@@ -197,6 +197,19 @@ pub fn init_lua() -> LuaResult<(Lua, EventRegistry, std::sync::mpsc::Receiver<Ve
     })?;
     proxy_table.set("spawn", spawn_fn)?;
 
+    // proxy.tasks — registry of named background-task handlers, invoked by the
+    // generic `ttyrell --task <name> [args...]` mode. Plugins register handlers
+    // with proxy.on_task(name, fn); all task logic then lives in Lua, so a new
+    // background-task plugin needs no Rust changes.
+    proxy_table.set("tasks", lua.create_table()?)?;
+    let on_task = lua.create_function(|lua_ctx, (name, func): (String, Function)| {
+        let proxy: mlua::Table = lua_ctx.globals().get("proxy")?;
+        let tasks: mlua::Table = proxy.get("tasks")?;
+        tasks.set(name, func)?;
+        Ok(())
+    })?;
+    proxy_table.set("on_task", on_task)?;
+
     // proxy.spinner_start() / proxy.spinner_stop() — animated "thinking" indicator.
     // LLM HTTP calls block the Lua thread, so the animation runs on a Rust thread
     // writing frames directly to stdout at the current cursor position. stop()

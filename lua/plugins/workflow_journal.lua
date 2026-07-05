@@ -37,7 +37,52 @@ JOURNAL_LLM = LLM.local_llama
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 
-if TTYRELL_MODE then return end  -- skip in background modes
+-- Background task: turn a session log into journal entries. Registered above the
+-- mode guard so it exists when `ttyrell --task journal` re-invokes this plugin in
+-- a detached process. All logic lives here in Lua.
+proxy.on_task("journal", function(log_path, journal_path, duration_secs)
+    local ok, llm = pcall(require, "llm")
+    if not (ok and llm) or not JOURNAL_PROMPT then return end
+
+    local lf = io.open(log_path, "r")
+    if not lf then return end
+    local log = lf:read("*a")
+    lf:close()
+    if log:gsub("%s", "") == "" then return end
+
+    local secs     = tonumber(duration_secs) or 0
+    local mins     = math.floor(secs / 60)
+    local duration = (mins > 0) and (mins .. "m " .. (secs % 60) .. "s") or (secs .. "s")
+
+    local tasks = llm.query(JOURNAL_PROMPT .. "\n- Session duration: " .. duration,
+        JOURNAL_LLM, log)
+    if not tasks then return end
+    local tasks_clean = tasks:gsub("%s*$", "")
+
+    -- Main journal file (full date + time heading)
+    local entry = "## " .. os.date("%Y-%m-%d %H:%M") .. " -- " .. duration .. "\n\n"
+               .. tasks_clean .. "\n\n---\n\n"
+    local f = io.open(journal_path, "a")
+    if f then f:write(entry); f:close() end
+
+    -- Obsidian daily note (time-only heading; date is the filename)
+    if JOURNAL_OBSIDIAN_VAULT then
+        local sub_dir   = JOURNAL_OBSIDIAN_DIR or "Work Journal"
+        local vault_dir = JOURNAL_OBSIDIAN_VAULT .. "/" .. sub_dir
+        if package.config:sub(1, 1) == "\\" then
+            os.execute('mkdir "' .. vault_dir:gsub("/", "\\") .. '" 2>nul')
+        else
+            os.execute('mkdir -p "' .. vault_dir .. '"')
+        end
+        local daily_file = vault_dir .. "/" .. os.date("%Y-%m-%d") .. ".md"
+        local obs_entry  = "## " .. os.date("%H:%M") .. " -- " .. duration .. "\n\n"
+                        .. tasks_clean .. "\n\n---\n\n"
+        local of = io.open(daily_file, "a")
+        if of then of:write(obs_entry); of:close() end
+    end
+end)
+
+if TTYRELL_MODE then return end  -- registered our task above; skip interactive wiring
 
 local data_dir
 if package.config:sub(1, 1) == '\\' then
@@ -74,7 +119,7 @@ proxy.on("session_end", function()
 
     local duration = math.max(1, os.time() - session_start)
     local bin = (TTYRELL_BIN or "ttyrell"):gsub('"', '')
-    proxy.spawn(string.format('"%s" --journal "%s" "%s" %d',
+    proxy.spawn(string.format('"%s" --task journal "%s" "%s" %d',
         bin, log_path, journal_path, duration))
     proxy.inject_output("[journal] writing work log in background → journal.md\r\n")
 end)
