@@ -214,6 +214,7 @@ local pending_cmd   = nil -- awaiting confirmation for an EXEC command
 local pending_write = nil -- awaiting confirmation for a proposed file write
 local capturing     = false -- true while reading an "[ai]> " question line
 local ai_buf        = {}  -- keystrokes typed while capturing
+local cursor        = 0   -- current cursor position in ai_buf (0 = start)
 local input_dirty   = false -- shell line likely has pending text the user typed
 
 -- Shared with session_log: while true, the keystrokes belong to the AI prompt and
@@ -662,15 +663,18 @@ proxy.on("input", function(data)
     -- (the whole chunk is ours) and flips true the moment we see the hotkey.
     local suppress = capturing
 
-    for i = 1, #data do
-        local ch = data:sub(i, i)
+    -- Process byte-by-byte using a while loop so we can skip remaining bytes
+    -- of multi-byte escape sequences (e.g. arrow keys: ESC [ A/B/C/D)
+    local pos = 1
+    while pos <= #data do
+        local ch = data:sub(pos, pos)
         local b  = ch:byte()
 
         if capturing then
             suppress = true
             if ch == "\r" or ch == "\n" then
                 local q = table.concat(ai_buf)
-                ai_buf, capturing = {}, false
+                ai_buf, capturing, cursor = {}, false, 0
                 if q:match("%S") then
                     -- Animated \ - / | spinner while the (blocking) query runs.
                     -- Runs on a Rust thread; guarded for older binaries. On
@@ -688,22 +692,43 @@ proxy.on("input", function(data)
                 else
                     cancel_capture("\r\n")  -- empty question
                 end
-            elseif b == 27 then            -- Esc cancels
-                cancel_capture("\r\n[ai] cancelled\r\n")
+            elseif b == 27 then
+                -- Check if ESC is part of an arrow key sequence (ESC [ A/B/C/D)
+                local n1 = data:sub(pos + 1, pos + 1)
+                local n2 = data:sub(pos + 2, pos + 2)
+                if n1 == "[" and (n2 == "A" or n2 == "B" or n2 == "C" or n2 == "D") then
+                    -- Arrow key — move cursor in the query buffer
+                    if n2 == "D" and cursor > 0 then
+                        -- Left arrow: move cursor back
+                        cursor = cursor - 1
+                        proxy.inject_output("\b")
+                    elseif n2 == "C" and cursor < #ai_buf then
+                        -- Right arrow: move cursor forward
+                        cursor = cursor + 1
+                        proxy.inject_output("\027[C")
+                    end
+                    -- Up (A) / Down (B) are ignored in the query buffer
+                    pos = pos + 3  -- skip ESC [ <letter>
+                else
+                    -- Standalone ESC cancels
+                    cancel_capture("\r\n[ai] cancelled\r\n")
+                end
             elseif b == 3 then             -- Ctrl-C cancels
                 cancel_capture("^C\r\n[ai] cancelled\r\n")
-            elseif b == 127 or b == 8 then -- Backspace: erase one echoed char
-                if #ai_buf > 0 then
-                    table.remove(ai_buf)
+            elseif b == 127 or b == 8 then -- Backspace: erase at cursor
+                if cursor > 0 then
+                    cursor = cursor - 1
+                    table.remove(ai_buf, cursor + 1)
                     proxy.inject_output("\b \b")
                 end
-            elseif b >= 32 then            -- Printable: buffer and echo it ourselves
-                ai_buf[#ai_buf + 1] = ch
+            elseif b >= 32 then            -- Printable: insert at cursor
+                table.insert(ai_buf, cursor + 1, ch)
+                cursor = cursor + 1
                 proxy.inject_output(ch)
             end
-            -- other control bytes (arrows, etc.) are swallowed while capturing
+            -- other control bytes are swallowed while capturing
         elseif b == HOTKEY then
-            capturing, suppress = true, true
+            capturing, suppress, cursor = true, true, 0
             ai_buf = {}
             if IS_WINDOWS then
                 -- Compose the question in the alternate screen buffer so nothing
@@ -725,6 +750,7 @@ proxy.on("input", function(data)
                 input_dirty = true   -- printable, or Tab completion
             end
         end
+        pos = pos + 1
     end
 
     sync_capture_flag()

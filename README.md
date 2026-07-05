@@ -252,6 +252,27 @@ The default provider table format is OpenAI-compatible. Override `headers`, `bui
 
 Plugins are loaded from `lua/plugins/` at startup. Each is optional — if the file is missing, it is silently skipped.
 
+### file_guard
+
+Backs up files before vim/nvim edits and diffs + summarizes changes when the
+TUI session ends.  Changes are logged to
+`~/.local/share/ttyrell/file_guard/changes.jsonl`.
+
+**How it works:**
+1. Detects `vim` / `nvim` commands via shell integration (`command_start`)
+2. Backs up the target file to `~/.local/share/ttyrell/file_guard/`
+3. On TUI exit, runs a unified diff against the backup
+4. Logs the diff (plus an optional LLM summary) to the changes JSONL file
+5. Shows a brief notification: `[file_guard] main.rs: +12 /-3 (logged)`
+
+**Configuration** (in `lua/plugins/file_guard.lua`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHANGE_SUMMARY_LLM` | `nil` | LLM provider for AI-generated change summary (e.g. `LLM.local_llama`) |
+| `CHANGE_IGNORED_PATTERNS` | `"*.swp *.swo *.lock"` | Space-separated glob patterns to skip |
+| `CHANGE_SUMMARY_PROMPT` | *(see file)* | Prompt template for the LLM diff summary |
+
 ### session_log
 
 Writes a full session transcript to the [session log directory](#session-log-locations). Captures every input line and every output chunk with timestamps. SSH sessions are captured automatically.
