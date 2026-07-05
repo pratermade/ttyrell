@@ -379,24 +379,26 @@ The `data` argument is the raw bytes received from stdin. In interactive use thi
 local llm = require("llm")
 ```
 
-### llm.setup(opts)
+### The LLM palette
 
-Configure the active provider. Must be called in `init.lua` before plugins that use `llm.query` are loaded. See [docs/llm-providers.md](llm-providers.md) for all provider configurations.
+Providers are defined as named entries in the global `LLM` table in `init.lua` — see [docs/llm-providers.md](llm-providers.md). A plugin picks one by reference and passes it to `llm.query`; there is no global "active provider". Expose the choice as a plugin-level variable so users can retarget it without touching your plugin body:
 
 ```lua
-llm.setup({
-    endpoint     = "http://localhost:8083/v1/chat/completions",
-    model        = "default",
-    system_prompt = "You are a helpful assistant.",  -- optional
-})
+MY_PLUGIN_LLM = LLM.local_llama   -- user can change this to any palette entry
 ```
 
-### llm.query(prompt)
+### llm.query(prompt, cfg [, context])
 
-Send a prompt and return the response. **Blocking** — the proxy event loop pauses until the LLM responds. Keep usage to user-initiated or infrequent events.
+Send a prompt to a provider and return the response. **Blocking** — the proxy event loop pauses until the LLM responds. Keep usage to user-initiated or infrequent events.
+
+| Argument | Description |
+|----------|-------------|
+| `prompt` | The instruction or question (string) |
+| `cfg` | A provider table from the `LLM` palette, e.g. `LLM.local_llama` |
+| `context` | Optional data blob appended after the prompt (recent output, file contents, …) |
 
 ```lua
-local response, err = llm.query("explain exit code 127")
+local response, err = llm.query("explain exit code 127", MY_PLUGIN_LLM, recent_output)
 if err then
     proxy.inject_output("\r\n[plugin] LLM error: " .. err .. "\r\n")
 else
@@ -485,7 +487,7 @@ local utils = require("utils")
 local log_dir = utils.log_dir()
 ```
 
-`require` caches modules — `require("llm")` called from multiple plugins returns the same table. `llm.setup()` in `init.lua` configures it once for all.
+`require` caches modules — `require("llm")` called from multiple plugins returns the same table. The `LLM` palette in `init.lua` is a global, so all plugins share the same provider definitions.
 
 ---
 

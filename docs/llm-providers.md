@@ -2,6 +2,22 @@
 
 ttyrell uses an OpenAI-compatible format by default. For other APIs, you override three functions: `headers`, `build_request`, and `parse_response`. The proxy itself doesn't know or care which LLM you use — all of that logic lives in Lua.
 
+Providers are defined as named entries in the global `LLM` table in `lua/init.lua` (the "palette"). A plugin picks a provider by reference, so different plugins can use different providers:
+
+```lua
+LLM = {
+    local_llama = { endpoint = "http://localhost:8083/v1/chat/completions", model = "default" },
+    claude      = { --[[ ... ]] },
+}
+```
+
+```lua
+AI_QUERY_LLM = LLM.local_llama   -- lua/plugins/ai_query.lua
+JOURNAL_LLM  = LLM.claude        -- lua/plugins/workflow_journal.lua
+```
+
+Plugins call `llm.query(prompt, cfg, context)`, passing the provider table as `cfg`.
+
 ---
 
 ## Table of contents
@@ -13,25 +29,25 @@ ttyrell uses an OpenAI-compatible format by default. For other APIs, you overrid
 - [Anthropic](#anthropic)
 - [Azure OpenAI](#azure-openai)
 - [Custom provider from scratch](#custom-provider-from-scratch)
-- [Switching providers at runtime](#switching-providers-at-runtime)
+- [Different providers per plugin](#different-providers-per-plugin)
 - [The three override functions](#the-three-override-functions)
 
 ---
 
 ## How the provider system works
 
-`lua/llm.lua` wraps `proxy.http_post` with a thin abstraction. The active provider is a table stored in a module-local variable. When you call `llm.query(prompt)`:
+`lua/llm.lua` wraps `proxy.http_post` with a thin abstraction. A provider is a plain Lua table from the `LLM` palette. When a plugin calls `llm.query(prompt, cfg, context)` (where `cfg` is the provider table):
 
-1. `build_request(cfg, prompt)` produces a Lua table (the request body)
+1. `build_request(cfg, prompt, context)` produces a Lua table (the request body)
 2. `proxy.json_encode` serialises it to JSON
 3. `headers(cfg)` produces the auth and content-type headers
 4. `proxy.http_post` sends the POST
 5. `proxy.json_decode` parses the JSON response
 6. `parse_response(parsed)` extracts the text from wherever the API put it
 
-Overriding any of those three functions lets you use any API without changing the Rust code.
+Overriding any of those three functions lets you use any API without changing the Rust code. If you omit them, OpenAI-compatible defaults are used. The only required fields are `endpoint` and `model`.
 
-All provider setup happens in `lua/init.lua`. Uncomment one block and fill in your values.
+All provider setup happens in the `LLM` table in `lua/init.lua`.
 
 ---
 
@@ -40,14 +56,14 @@ All provider setup happens in `lua/init.lua`. Uncomment one block and fill in yo
 llama-server ships with llama.cpp and implements the OpenAI chat completions API. No API key needed.
 
 ```lua
-local llm = require("llm")
-
-llm.setup({
-    endpoint = "http://localhost:8083/v1/chat/completions",
-    model    = "default",
-    -- system_prompt is optional; defaults to:
-    -- "You are a helpful terminal assistant. Be concise."
-})
+LLM = {
+    local_llama = {
+        endpoint = "http://localhost:8083/v1/chat/completions",
+        model    = "default",
+        -- system_prompt is optional; defaults to:
+        -- "You are a helpful terminal assistant. Be concise."
+    },
+}
 ```
 
 Start the server with:
@@ -61,43 +77,43 @@ The `model` field is sent in the request body. llama-server ignores it (it alway
 
 ## Ollama
 
-Ollama implements the OpenAI-compatible API at `/api/chat` but uses a slightly different request format. Use the OpenAI-compatible endpoint:
+Ollama exposes an OpenAI-compatible endpoint — the simplest option:
 
 ```lua
-local llm = require("llm")
-
-llm.setup({
-    endpoint = "http://localhost:11434/v1/chat/completions",
-    model    = "llama3.2",   -- must match a pulled model
-})
+LLM = {
+    ollama = {
+        endpoint = "http://localhost:11434/v1/chat/completions",
+        model    = "llama3.2",   -- must match a pulled model
+    },
+}
 ```
 
-Or use Ollama's native API:
+Or use Ollama's native API by overriding the request/response shape:
 
 ```lua
-local llm = require("llm")
+LLM = {
+    ollama = {
+        endpoint      = "http://localhost:11434/api/generate",
+        model         = "llama3.2",
+        system_prompt = "You are a helpful terminal assistant. Be concise.",
 
-llm.setup({
-    endpoint      = "http://localhost:11434/api/generate",
-    model         = "llama3.2",
-    system_prompt = "You are a helpful terminal assistant. Be concise.",
+        build_request = function(cfg, prompt, context)
+            return {
+                model  = cfg.model,
+                system = cfg.system_prompt,
+                prompt = context and (prompt .. "\n\n" .. context) or prompt,
+                stream = false,
+            }
+        end,
 
-    build_request = function(cfg, prompt)
-        return {
-            model  = cfg.model,
-            system = cfg.system_prompt,
-            prompt = prompt,
-            stream = false,
-        }
-    end,
-
-    parse_response = function(parsed)
-        if not parsed or not parsed.response then
-            return nil, "no response field"
-        end
-        return parsed.response, nil
-    end,
-})
+        parse_response = function(parsed)
+            if not parsed or not parsed.response then
+                return nil, "no response field"
+            end
+            return parsed.response, nil
+        end,
+    },
+}
 ```
 
 ---
@@ -105,14 +121,13 @@ llm.setup({
 ## OpenAI
 
 ```lua
-local llm = require("llm")
-
-llm.setup({
-    endpoint = "https://api.openai.com/v1/chat/completions",
-    api_key  = os.getenv("OPENAI_API_KEY"),
-    model    = "gpt-4o-mini",   -- or gpt-4o, o1-mini, etc.
-    system_prompt = "You are a helpful terminal assistant. Be concise.",
-})
+LLM = {
+    openai = {
+        endpoint = "https://api.openai.com/v1/chat/completions",
+        api_key  = os.getenv("OPENAI_API_KEY"),
+        model    = "gpt-4o-mini",   -- or gpt-4o, o1-mini, etc.
+    },
+}
 ```
 
 The `api_key` field is automatically placed in the `Authorization: Bearer` header by the default `headers` function.
@@ -131,72 +146,71 @@ Or set it in `~/.zshrc` / `~/.bashrc` so it's always available.
 Anthropic's API uses a different auth header scheme, request body format, and response shape. Override all three functions:
 
 ```lua
-local llm = require("llm")
+LLM = {
+    claude = {
+        endpoint = "https://api.anthropic.com/v1/messages",
+        api_key  = os.getenv("ANTHROPIC_API_KEY"),
+        model    = "claude-haiku-4-5-20251001",   -- fast and cheap; use claude-opus-4-8 for best quality
+        system_prompt = "You are a helpful terminal assistant. Be concise.",
 
-llm.setup({
-    endpoint  = "https://api.anthropic.com/v1/messages",
-    api_key   = os.getenv("ANTHROPIC_API_KEY"),
-    model     = "claude-haiku-4-5-20251001",   -- fast and cheap; use claude-opus-4-8 for best quality
-    system_prompt = "You are a helpful terminal assistant. Be concise.",
+        headers = function(cfg)
+            return {
+                ["x-api-key"]         = cfg.api_key,
+                ["anthropic-version"] = "2023-06-01",
+            }
+        end,
 
-    headers = function(cfg)
-        return {
-            ["x-api-key"]         = cfg.api_key,
-            ["anthropic-version"] = "2023-06-01",
-        }
-    end,
+        build_request = function(cfg, prompt, context)
+            return {
+                model      = cfg.model,
+                max_tokens = 1024,
+                system     = cfg.system_prompt,
+                messages   = {{
+                    role    = "user",
+                    content = context and (prompt .. "\n\n" .. context) or prompt,
+                }},
+            }
+        end,
 
-    build_request = function(cfg, prompt)
-        return {
-            model      = cfg.model,
-            max_tokens = 1024,
-            system     = cfg.system_prompt,
-            messages   = {{ role = "user", content = prompt }},
-        }
-    end,
-
-    parse_response = function(parsed)
-        if not parsed or not parsed.content or #parsed.content == 0 then
-            return nil, "no content in response"
-        end
-        local block = parsed.content[1]
-        if block.type ~= "text" then
-            return nil, "unexpected content type: " .. tostring(block.type)
-        end
-        return block.text, nil
-    end,
-})
+        parse_response = function(parsed)
+            if not parsed or not parsed.content or #parsed.content == 0 then
+                return nil, "no content in response"
+            end
+            return parsed.content[1].text, nil
+        end,
+    },
+}
 ```
 
-Available Anthropic models (as of mid-2025):
+Available Anthropic models:
 - `claude-haiku-4-5-20251001` — fastest, cheapest
-- `claude-sonnet-4-6` — balanced
+- `claude-sonnet-5` — balanced
 - `claude-opus-4-8` — most capable
 
 ---
 
 ## Azure OpenAI
 
-Azure uses a different base URL and auth scheme. The request and response format is the same as OpenAI.
+Azure uses a different base URL and auth scheme. The request and response format is the same as OpenAI, so only `endpoint` and `headers` need attention. Define the locals above the `LLM` table:
 
 ```lua
-local llm = require("llm")
-
 local AZURE_ENDPOINT  = os.getenv("AZURE_OPENAI_ENDPOINT")   -- https://YOUR_RESOURCE.openai.azure.com
 local AZURE_KEY       = os.getenv("AZURE_OPENAI_KEY")
 local DEPLOYMENT_NAME = "gpt-4o"   -- your Azure deployment name
 
-llm.setup({
-    endpoint = AZURE_ENDPOINT .. "/openai/deployments/" .. DEPLOYMENT_NAME
-              .. "/chat/completions?api-version=2024-02-01",
-    model    = DEPLOYMENT_NAME,
+LLM = {
+    azure = {
+        endpoint = AZURE_ENDPOINT .. "/openai/deployments/" .. DEPLOYMENT_NAME
+                  .. "/chat/completions?api-version=2024-02-01",
+        model    = DEPLOYMENT_NAME,
 
-    headers = function(cfg)
-        return { ["api-key"] = AZURE_KEY }
-    end,
+        headers = function(cfg)
+            return { ["api-key"] = AZURE_KEY }
+        end,
 
-    -- build_request and parse_response use OpenAI defaults — no override needed
-})
+        -- build_request and parse_response use OpenAI defaults — no override needed
+    },
+}
 ```
 
 ---
@@ -206,70 +220,64 @@ llm.setup({
 Implement all three functions for an API that has nothing in common with OpenAI:
 
 ```lua
-local llm = require("llm")
+LLM = {
+    internal = {
+        endpoint = "https://my-internal-ai.corp.example/v1/complete",
+        api_key  = os.getenv("INTERNAL_AI_KEY"),
 
-llm.setup({
-    endpoint = "https://my-internal-ai.corp.example/v1/complete",
-    api_key  = os.getenv("INTERNAL_AI_KEY"),
+        headers = function(cfg)
+            return {
+                ["X-API-Token"] = cfg.api_key,
+                ["X-Client"]    = "ttyrell",
+            }
+        end,
 
-    headers = function(cfg)
-        return {
-            ["X-API-Token"] = cfg.api_key,
-            ["X-Client"]    = "ttyrell",
-        }
-    end,
+        build_request = function(cfg, prompt, context)
+            return {
+                instruction  = cfg.system_prompt,
+                user_message = context and (prompt .. "\n\n" .. context) or prompt,
+                max_output   = 500,
+            }
+        end,
 
-    build_request = function(cfg, prompt)
-        return {
-            instruction  = cfg.system_prompt,
-            user_message = prompt,
-            max_output   = 500,
-        }
-    end,
-
-    parse_response = function(parsed)
-        -- parsed is the decoded JSON response as a Lua table
-        if not parsed or parsed.status ~= "ok" then
-            return nil, "unexpected status: " .. tostring(parsed and parsed.status)
-        end
-        return parsed.result.text, nil
-    end,
-})
+        parse_response = function(parsed)
+            -- parsed is the decoded JSON response as a Lua table
+            if not parsed or parsed.status ~= "ok" then
+                return nil, "unexpected status: " .. tostring(parsed and parsed.status)
+            end
+            return parsed.result.text, nil
+        end,
+    },
+}
 ```
 
 ---
 
-## Switching providers at runtime
+## Different providers per plugin
 
-`llm.setup()` replaces the active provider. You can call it multiple times — the most recent call wins. This lets you define convenience functions in `init.lua`:
+Because the `LLM` palette can hold several providers and each plugin names the one it wants, you can mix and match — a fast local model for `ai_query`, a stronger cloud model for the journal:
 
 ```lua
-local llm = require("llm")
-
-local PROVIDERS = {
-    local_fast = {
-        endpoint = "http://localhost:8083/v1/chat/completions",
-        model    = "default",
-    },
-    openai = {
-        endpoint = "https://api.openai.com/v1/chat/completions",
-        api_key  = os.getenv("OPENAI_API_KEY"),
-        model    = "gpt-4o",
-    },
+LLM = {
+    local_fast = { endpoint = "http://localhost:8083/v1/chat/completions", model = "default" },
+    claude     = { --[[ ...as above... ]] },
 }
 
--- Start with local by default
-llm.setup(PROVIDERS.local_fast)
+AI_QUERY_LLM = LLM.local_fast
+JOURNAL_LLM  = LLM.claude
+```
 
--- Switch with #llm: command
+To switch a plugin's provider at runtime, reassign its variable — plugins read it fresh on each call. For example, a `#llm:` command that retargets `ai_query`:
+
+```lua
 proxy.on("input", function(data)
-    local provider = data:match("^#llm:%s*(%S+)")
-    if not provider then return end
-    if PROVIDERS[provider] then
-        llm.setup(PROVIDERS[provider])
-        proxy.inject_output("\r\n[llm] switched to " .. provider .. "\r\n")
+    local name = data:match("^#llm:%s*(%S+)")
+    if not name then return end
+    if LLM[name] then
+        AI_QUERY_LLM = LLM[name]
+        proxy.inject_output("\r\n[llm] ai_query now uses " .. name .. "\r\n")
     else
-        proxy.inject_output("\r\n[llm] unknown provider: " .. provider .. "\r\n")
+        proxy.inject_output("\r\n[llm] unknown provider: " .. name .. "\r\n")
     end
     return "suppress"
 end)
@@ -292,18 +300,19 @@ headers = function(cfg)
 end
 ```
 
-### build_request(cfg, prompt)
+### build_request(cfg, prompt, context)
 
-Returns a Lua table that is JSON-encoded and sent as the POST body. The `cfg` argument is the full provider table so you can access `cfg.model`, `cfg.system_prompt`, and any custom fields you added at setup time.
+Returns a Lua table that is JSON-encoded and sent as the POST body. `cfg` is the full provider table, so you can access `cfg.model`, `cfg.system_prompt`, and any custom fields you added. `context` is the optional third argument from `llm.query` (log output, file contents, …); append it to the user message so the model can see it — the default builder joins them with a blank line.
 
 ```lua
-build_request = function(cfg, prompt)
+build_request = function(cfg, prompt, context)
+    local user = context and (prompt .. "\n\n" .. context) or prompt
     return {
         model       = cfg.model,
         temperature = cfg.temperature or 0.7,
         messages    = {
             { role = "system", content = cfg.system_prompt },
-            { role = "user",   content = prompt },
+            { role = "user",   content = user },
         },
         stream = false,
     }

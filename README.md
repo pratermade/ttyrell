@@ -70,7 +70,7 @@ To re-run the wizard (e.g. to change providers or reinstall): `ttyrell --install
 
 ## Terminal setup
 
-Tell your terminal to use `ttyrell` as its shell. It spawns your real `$SHELL` (or `%COMSPEC%` on Windows) internally.
+Tell your terminal to use `ttyrell` as its shell. It spawns your real shell internally: `$SHELL` on macOS/Linux. On Windows it uses `TTYRELL_SHELL` if set, otherwise detects the shell you launched it from (e.g. PowerShell), falling back to `%COMSPEC%` (cmd.exe).
 
 **Ghostty** (`~/.config/ghostty/config`):
 
@@ -111,6 +111,8 @@ program = "/home/you/.local/bin/ttyrell"
   "hidden": false
 }
 ```
+
+Launched this way there is no invoking shell to detect, so ttyrell falls back to `cmd.exe`. To run PowerShell inside instead, set the shell explicitly — either add `"environment": { "TTYRELL_SHELL": "powershell.exe" }` to the profile, or set `TTYRELL_SHELL` as a user environment variable.
 
 ### Using ttyrell with tmux
 
@@ -268,7 +270,7 @@ Press the hotkey (**Ctrl-G** by default) at any prompt to open an `[ai]> ` line.
 
 The keystrokes are intercepted and never reach the shell, so this works identically on cmd.exe, PowerShell, and POSIX shells. (Earlier versions used a `#ai:` text prefix, which relied on the line being a shell comment — that broke on cmd.exe, where `#` is not a comment.)
 
-The model is told which shell and OS you are running, so suggested commands use the right syntax (PowerShell vs. bash, etc.). If the LLM can provide a complete runnable command it appends `EXEC: <cmd>` — ttyrell shows it and asks `[y/N]` before running anything.
+The model is told which shell and OS you are running, so suggested commands use the right syntax (PowerShell vs. bash, etc.). If the LLM can provide a complete runnable command it appends `EXEC: <cmd>` — ttyrell shows it and asks for confirmation (`y` or Enter to run) before running anything.
 
 On Windows, ConPTY tracks the shell's screen with absolute coordinates, so anything ttyrell draws directly onto the main screen desynchronizes the cursor and garbles later output. To avoid that, the question prompt opens in a temporary full-screen overlay (the alternate screen buffer, like `less`); when you press Enter it's torn down, restoring your screen exactly. The response is then displayed *by the shell itself*: the answer is written to `%LOCALAPPDATA%\ttyrell\ai_last.txt` and ttyrell types a `type <file>` command at your prompt, so it lands inline in your scrollback with a fresh prompt automatically. When the response includes a runnable command, press `y` or Enter at that prompt to run it; `n`/Esc declines, and any other key just types normally.
 
@@ -370,12 +372,14 @@ end
 
 ```lua
 proxy.on(event, fn)                       -- register event handler
+proxy.on_task(name, fn)                    -- register a `ttyrell --task <name>` handler
 proxy.inject_output(text)                 -- write text to terminal
-proxy.spawn(cmd)                          -- run a shell command in the background
+proxy.spawn(cmd)                          -- run a shell command in the background (detached)
 proxy.send_input(text)                    -- write text to the PTY as if typed
 proxy.http_post(url, body [, headers])    -- returns status_code, body_string
 proxy.json_encode(value)                  -- Lua value → JSON string
 proxy.json_decode(string)                 -- JSON string → Lua value
+proxy.spinner_start() / spinner_stop()    -- animated "thinking" indicator at the cursor
 proxy.session_info.host                   -- hostname of local machine
 proxy.session_info.shell                  -- shell path (e.g. /bin/zsh)
 proxy.session_info.version                -- ttyrell version string
