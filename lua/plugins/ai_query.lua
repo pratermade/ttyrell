@@ -488,7 +488,18 @@ local function query_llm(raw)
     end
 
     -- A file-write proposal takes precedence over EXEC.
-    local wpath, wcontent = response:match("<<<FILE%s+(.-)%s*>>>\n(.-)\n<<<ENDFILE>>>")
+    -- Lua's . metacharacter does not match newlines, so a single match() cannot
+    -- capture multi-line content. Use find() with a position-capture trick to
+    -- locate the boundaries, then sub() to extract the file content.
+    local wpath, wcontent = nil, nil
+    local p1, _, cap_path, content_start = response:find("<<<FILE%s+(.-)%s*>>>\n()")
+    if p1 and cap_path ~= "" then
+        local content_end = response:find("\n<<<ENDFILE>>>", content_start, true)
+        if content_end then
+            wpath = cap_path
+            wcontent = response:sub(content_start, content_end - 1)
+        end
+    end
     if wpath and wpath ~= "" then
         -- Defensive: strip a wrapping code fence if the model added one anyway.
         wcontent = wcontent:gsub("^```[%w]*\n", ""):gsub("\n```%s*$", "")
