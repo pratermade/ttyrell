@@ -269,6 +269,13 @@ proxy.on("command_start", function()
         vim_active = true
         edited_path    = abs
         edited_backup  = bkp
+        proxy.inject_output(
+            string.format(
+                "\r\n[file_guard] backed up: %s\n       → %s\r\n",
+                abs,
+                bkp
+            )
+        )
     end
 end)
 
